@@ -141,7 +141,7 @@ class BPETokenizer:
 
         if verbose:
             total = sum(counts.values())
-            print(f"  {total:,} pre-tokens, {len(counts):,} distinct")
+            print(f"  {total:,} pre-tokens, {len(counts):,} distinct", flush=True)
 
         words: list[list[int]] = [list(w) for w in counts]
         freqs: list[int] = list(counts.values())
@@ -167,7 +167,7 @@ class BPETokenizer:
             best = max(pair_counts, key=lambda p: (pair_counts[p], p))
             if pair_counts[best] < min_frequency:
                 if verbose:
-                    print(f"  stopping at {step} merges: best pair seen {pair_counts[best]}x")
+                    print(f"  stopping at {step} merges: best pair seen {pair_counts[best]}x", flush=True)
                 break
 
             merges[best] = next_id
@@ -196,7 +196,7 @@ class BPETokenizer:
             next_id += 1
 
             if verbose and (step + 1) % 1000 == 0:
-                print(f"  {step + 1:,}/{n_merges:,} merges, {len(pair_counts):,} pairs live")
+                print(f"  {step + 1:,}/{n_merges:,} merges, {len(pair_counts):,} pairs live", flush=True)
 
         special_ids = {tok: next_id + i for i, tok in enumerate(specials)}
         return cls(merges=merges, special_tokens=special_ids)
