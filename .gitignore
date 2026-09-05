@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Training artefacts -- checkpoints and datasets are big and reproducible.
+# bench/results/ is deliberately NOT here: committed benchmark JSON is a
+# deliverable, not a build product.
+checkpoints/
+data/
+*.bin
+*.safetensors
+wandb/
+
+# Local
+.env
+*.log
