@@ -33,6 +33,7 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--no-compile", action="store_true", help="disable torch.compile")
     ap.add_argument("--fresh", action="store_true", help="ignore existing checkpoints")
     args = ap.parse_args()
 
@@ -62,6 +63,7 @@ def main() -> int:
         device=args.device,
         dtype=args.dtype,
         seed=args.seed,
+        compile=not args.no_compile,
         **overrides,
     )
 

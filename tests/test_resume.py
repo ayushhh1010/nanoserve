@@ -55,6 +55,7 @@ def cfg(tmp_path) -> TrainConfig:
         eval_batches=2,
         device="cpu",
         dtype="float32",
+        compile=False,  # tests want fast start-up and exact fp32, not fused kernels
         model=TINY_MODEL,
     )
 

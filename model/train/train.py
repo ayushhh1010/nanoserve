@@ -80,6 +80,11 @@ class TrainConfig:
     out_dir: Path = Path("checkpoints")
 
     # -- misc ---------------------------------------------------------------
+    # torch.compile fuses the ~700 tiny kernels an eager step launches into a
+    # handful of generated ones. Measured 1.61x here (29,400 -> 47,420 tok/s),
+    # for a one-time ~2 min compile. Needs triton; on Windows that is the
+    # separate `triton-windows` package.
+    compile: bool = True
     seed: int = 1337
     device: str = "cuda"
     dtype: str = "bfloat16"
@@ -154,6 +159,12 @@ class Trainer:
             torch.set_float32_matmul_precision("high")
 
         self.model = NanoForCausalLM(cfg.model).to(self.device)
+        # `self.model` stays the uncompiled module and is the only thing ever
+        # saved or loaded: torch.compile returns a wrapper whose state_dict
+        # keys are prefixed with "_orig_mod.", which would make every
+        # checkpoint incompatible with an uncompiled run (and with the HF
+        # export in week 3). `self.fwd` is what actually runs.
+        self.fwd = torch.compile(self.model) if cfg.compile else self.model
         self.opt = build_optimizer(self.model, cfg)
 
         self.train_data = TokenDataset(cfg.train_bin, cfg.seq_len)
@@ -202,7 +213,7 @@ class Trainer:
         for _ in range(cfg.grad_accum):
             tokens = self.train_data.batch(cfg.micro_batch, self.device, self.data_gen)
             with self._autocast():
-                _, loss = self.model(tokens, labels=tokens)
+                _, loss = self.fwd(tokens, labels=tokens)
             # Scale so the accumulated gradient is the mean over the full
             # batch, not the sum over micro-batches.
             (loss / cfg.grad_accum).backward()
@@ -230,7 +241,7 @@ class Trainer:
         for _ in range(self.cfg.eval_batches):
             tokens = self.val_data.batch(self.cfg.micro_batch, self.device, gen)
             with self._autocast():
-                _, loss = self.model(tokens, labels=tokens)
+                _, loss = self.fwd(tokens, labels=tokens)
             total += loss.item()
         self.model.train()
         return total / self.cfg.eval_batches
