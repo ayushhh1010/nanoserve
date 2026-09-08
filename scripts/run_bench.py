@@ -32,6 +32,7 @@ ENGINES = {
     "baseline": dict(use_cache=True),          # cache grows by torch.cat
     "baseline-nocache": dict(use_cache=False),  # no cache: re-attend every token
     "baseline-static": dict(use_cache=True),    # preallocated contiguous slot
+    "baseline-paged": dict(use_cache=True),     # block table + free list
 }
 
 
@@ -61,6 +62,8 @@ def main() -> int:
                     help="KV pool budget for --engine baseline-static")
     ap.add_argument("--max-seq-len", type=int, default=1024,
                     help="per-slot reservation for the contiguous pool")
+    ap.add_argument("--block-size", type=int, default=16,
+                    help="tokens per block for --engine baseline-paged")
     ap.add_argument("--repeats", type=int, default=1,
                     help="run the identical workload N times and report the spread")
     ap.add_argument("--out", type=Path, default=None)
@@ -101,14 +104,22 @@ def main() -> int:
     )
 
     def make_kv_pool():
-        from engine.kv_cache import StaticCachePool, slots_for_budget
-
         budget = args.kv_budget_mb * 1024 * 1024
-        n = slots_for_budget(model.cfg, budget, args.max_seq_len)
-        kv = StaticCachePool(
-            model.cfg, num_slots=n, max_seq_len=args.max_seq_len,
-            device=args.device, dtype=getattr(torch, args.dtype),
-        )
+        dtype = getattr(torch, args.dtype)
+        if args.engine == "baseline-paged":
+            from engine.block_manager import PagedCachePool, blocks_for_budget
+
+            kv = PagedCachePool(
+                model.cfg, num_blocks=blocks_for_budget(model.cfg, budget, args.block_size),
+                block_size=args.block_size, device=args.device, dtype=dtype,
+            )
+        else:
+            from engine.kv_cache import StaticCachePool, slots_for_budget
+
+            kv = StaticCachePool(
+                model.cfg, num_slots=slots_for_budget(model.cfg, budget, args.max_seq_len),
+                max_seq_len=args.max_seq_len, device=args.device, dtype=dtype,
+            )
         print(f"kv pool: {kv}")
         return kv
 
@@ -118,7 +129,7 @@ def main() -> int:
             print(f"\n--- repeat {rep + 1}/{args.repeats} ---", flush=True)
         engine = BaselineEngine(
             model, eos_token_id=tok.eos_id, device=args.device,
-            pool=make_kv_pool() if args.engine == "baseline-static" else None,
+            pool=make_kv_pool() if args.engine in ("baseline-static", "baseline-paged") else None,
             **ENGINES[args.engine],
         )
         engine.name = args.engine

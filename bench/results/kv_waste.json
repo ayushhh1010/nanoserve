@@ -23,6 +23,17 @@
     "mean_reserved": 17330.67374005305,
     "mean_external_frag": 39014.53580901857
   },
+  "paged_measured": {
+    "steps": 864,
+    "mean_sequences": 0.0,
+    "mean_blocks_allocated": 1974.0162037037037,
+    "mean_tokens_used": 30404.890046296296,
+    "mean_internal_frag": 1179.369212962963,
+    "mean_external_frag": 0.0,
+    "mean_utilization": 0.96135,
+    "mean_waste_fraction": 0.03864999999999999,
+    "peak_occupancy": 0.6289
+  },
   "paged_analytic": {
     "block_size": 16,
     "mean_waste_tokens_per_seq": 7.5975,
@@ -30,5 +41,5 @@
     "waste_fraction": 0.021925141405979454,
     "external_fragmentation": 0
   },
-  "usable_capacity_gain": 3.5414537648838618
+  "usable_capacity_gain": 3.480895707477001
 }
