@@ -161,6 +161,108 @@ def save_result(result: RunResult, path: Path, extra: dict | None = None) -> Pat
     return path
 
 
+def aggregate(summaries: list[dict]) -> dict:
+    """Combine repeated runs of the same configuration.
+
+    Standard practice is to repeat a benchmark and report the spread, not a
+    single number, and this project has a specific reason to care: two correct
+    measurements here once differed by 55% purely because the machine changed
+    power state between them. A single run cannot tell you that happened; a
+    coefficient of variation across repeats can.
+
+    Reports the median as the headline (robust to one bad run) alongside the
+    spread, and flags configurations whose variation is high enough that the
+    comparison should not be trusted.
+    """
+    if len(summaries) == 1:
+        return {"repeats": 1, "median": summaries[0], "stable": True}
+
+    def pluck(path: tuple[str, ...]) -> list[float]:
+        out = []
+        for s in summaries:
+            node = s
+            for key in path:
+                node = node[key]
+            if node is not None:
+                out.append(float(node))
+        return out
+
+    tracked = {
+        "output_tokens_per_s": ("throughput", "output_tokens_per_s"),
+        "requests_per_s": ("throughput", "requests_per_s"),
+        "goodput_per_s": ("goodput", "requests_per_s"),
+        "ttft_p50": ("latency_s", "ttft", "p50"),
+        "ttft_p99": ("latency_s", "ttft", "p99"),
+        "itl_p50": ("latency_s", "inter_token", "p50"),
+        "itl_p99": ("latency_s", "inter_token", "p99"),
+    }
+
+    stats, worst_cv = {}, 0.0
+    for name, path in tracked.items():
+        vals = pluck(path)
+        if not vals:
+            continue
+        arr = np.asarray(vals)
+        mean = float(arr.mean())
+        # Coefficient of variation: spread relative to magnitude, so a latency
+        # in milliseconds and a throughput in thousands are comparable.
+        cv = float(arr.std() / mean) if mean else 0.0
+        stats[name] = {
+            "median": float(np.median(arr)),
+            "mean": mean,
+            "std": float(arr.std()),
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+            "cv": cv,
+            "values": vals,
+        }
+        # Tail percentiles are legitimately noisy; hold them to a looser bar
+        # than throughput, which should be steady on a healthy machine.
+        if not name.endswith("p99"):
+            worst_cv = max(worst_cv, cv)
+
+    return {
+        "repeats": len(summaries),
+        "median": summaries[len(summaries) // 2],
+        "across_repeats": stats,
+        "worst_cv": worst_cv,
+        # 5% is tight enough to catch a thermal ramp or a power-state change,
+        # loose enough not to fire on ordinary scheduling noise.
+        "stable": worst_cv < 0.05,
+    }
+
+
+def format_repeats(agg: dict) -> str:
+    if agg["repeats"] == 1:
+        return ""
+    lines = [
+        "",
+        f"  across {agg['repeats']} repeats:",
+        f"  {'':22}{'median':>10}{'min':>10}{'max':>10}{'cv':>8}",
+    ]
+    for name, s in agg["across_repeats"].items():
+        # Latencies are stored in seconds but read in milliseconds everywhere
+        # else in this output. Scale them here rather than leaving two units
+        # in one report.
+        latency = name.startswith(("ttft", "itl", "e2e"))
+        scale = 1000.0 if latency else 1.0
+        label = f"{name} (ms)" if latency else name
+        lines.append(
+            f"  {label:<22}{s['median'] * scale:>10.2f}{s['min'] * scale:>10.2f}"
+            f"{s['max'] * scale:>10.2f}{s['cv'] * 100:>7.1f}%"
+        )
+    if not agg["stable"]:
+        lines += [
+            "",
+            f"  UNSTABLE: worst coefficient of variation {agg['worst_cv'] * 100:.1f}% "
+            f"exceeds 5%.",
+            "  The machine changed underneath the run -- thermal ramp, power state,",
+            "  or another process competing. Do not compare these numbers to another",
+            "  configuration until the run is stable.",
+        ]
+    return "\n".join(lines)
+
+
 def format_summary(summary: dict) -> str:
     """A compact human-readable block, printed after every run."""
     c, t, g, lat = summary["counts"], summary["throughput"], summary["goodput"], summary["latency_s"]

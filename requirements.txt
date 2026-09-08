@@ -1,0 +1,19 @@
+# Direct dependencies. Exact versions of the full transitive tree are pinned in
+# requirements.lock.txt.
+#
+# torch must come from PyTorch's own index, not PyPI -- the PyPI Windows wheel
+# is CPU-only:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# triton is required for torch.compile and is not shipped with PyTorch on
+# Windows; install triton-windows there and triton elsewhere.
+
+torch>=2.11
+numpy>=2.0
+matplotlib>=3.9      # loss curves
+reportlab>=4.0       # phase reports
+safetensors>=0.4     # model export
+huggingface-hub>=0.24
+pytest>=8.0
+transformers>=4.44   # test-only: HF Llama parity reference
+pypdf>=5.0           # test-only: PDF verification

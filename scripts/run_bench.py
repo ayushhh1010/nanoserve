@@ -19,7 +19,7 @@ from pathlib import Path
 
 import torch
 
-from bench.metrics import format_summary, save_result
+from bench.metrics import aggregate, format_repeats, format_summary, save_result
 from bench.runner import RunnerConfig, run
 from bench.workload import WorkloadConfig, build_workload, load_prompt_pool, summarise
 from engine.baseline import BaselineEngine
@@ -56,6 +56,8 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=12)
     ap.add_argument("--synthetic", action="store_true",
                     help="use random token ids instead of real text")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="run the identical workload N times and report the spread")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--tag", default="", help="suffix for the results filename")
     args = ap.parse_args()
@@ -93,25 +95,37 @@ def main() -> int:
         f"rate={'burst' if args.rate is None else f'{args.rate}/s'}"
     )
 
-    engine = BaselineEngine(
-        model, eos_token_id=tok.eos_id, device=args.device, **ENGINES[args.engine]
-    )
-    engine.name = args.engine
+    summaries = []
+    for rep in range(args.repeats):
+        if args.repeats > 1:
+            print(f"\n--- repeat {rep + 1}/{args.repeats} ---", flush=True)
+        engine = BaselineEngine(
+            model, eos_token_id=tok.eos_id, device=args.device, **ENGINES[args.engine]
+        )
+        engine.name = args.engine
+        # Rebuild the workload each repeat: Request objects carry mutable
+        # timing state, so reusing them would measure the second run against
+        # the first run's timestamps.
+        reqs = build_workload(wcfg, tok.vocab_size, tok.eos_id, pool)
+        result = run(
+            engine, reqs, wsummary,
+            RunnerConfig(warmup_requests=args.warmup, verbose=args.repeats == 1),
+            vocab_size=tok.vocab_size,
+        )
+        summaries.append(result.summary())
 
-    result = run(
-        engine, requests, wsummary,
-        RunnerConfig(warmup_requests=args.warmup), vocab_size=tok.vocab_size,
-    )
-
-    summary = result.summary()
+    summary = summaries[len(summaries) // 2]
+    agg = aggregate(summaries)
     print()
     print(format_summary(summary))
+    if args.repeats > 1:
+        print(format_repeats(agg))
 
     name = args.tag or f"{args.engine}_n{args.requests}" + (
         f"_r{args.rate:g}" if args.rate else "_burst"
     )
     out = args.out or ROOT / "bench" / "results" / f"{name}.json"
-    save_result(result, out, extra={"workload_config": wcfg.to_dict()})
+    save_result(result, out, extra={"workload_config": wcfg.to_dict(), "repeats": agg})
     print(f"\nwrote {out.relative_to(ROOT)}")
     return 0
 
