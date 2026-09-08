@@ -18,3 +18,6 @@ wandb/
 # Local
 .env
 *.log
+
+# Export directory is a build artifact, regenerable from a checkpoint.
+export/
