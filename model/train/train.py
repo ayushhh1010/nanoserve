@@ -387,6 +387,13 @@ class Trainer:
 
         self.save(f"step_{self.step:06d}.pt")
         val = self.evaluate()
+        # The final evaluation has to be able to win. Without this, a run whose
+        # last steps improve on the previous eval leaves best.pt pointing at a
+        # strictly worse model -- which is exactly what happened on run1
+        # (best.pt val 1.1518 at step 16,000 vs 1.1510 at the end).
+        if val < self.best_val:
+            self.best_val = val
+            self.save("best.pt")
         print(
             f"\ndone: {self.step:,} steps, {self.tokens_seen / 1e6:,.0f}M tokens, "
             f"{(time.perf_counter() - t0) / 3600:.2f}h, final val {val:.4f} "
