@@ -1,0 +1,133 @@
+"""Driving an engine against an arrival schedule.
+
+**Open loop, not closed loop.** Requests are submitted when their arrival time
+says so, whether or not the engine has kept up. A closed-loop harness -- N
+workers that each submit the next request only after the previous one returns --
+is self-limiting: it cannot generate more load than the system can absorb, so
+it can never show a queue growing, latency collapsing, or goodput falling off a
+cliff. Those are precisely the phenomena this phase is about, so the load
+generator must be willing to overwhelm the engine.
+
+**Warm-up is not optional.** The first measurement in this project was 33
+tokens/sec against a roofline of 3,100, and a large part of that was a GPU
+sitting at 210 MHz because the benchmark ran three warm-up iterations on an
+idle card. Every run here warms the model until the clocks are up and the
+allocator has settled.
+"""
+
+from __future__ import annotations
+
+import time
+from collections import deque
+from dataclasses import dataclass
+
+import torch
+
+from bench.metrics import RunResult
+from engine.types import Request, SamplingParams
+
+
+@dataclass
+class RunnerConfig:
+    #: Warm-up generations before the clock starts. Enough to clock the GPU up
+    #: and let the caching allocator reach steady state.
+    warmup_requests: int = 12
+    warmup_prompt_len: int = 128
+    warmup_output_len: int = 32
+    #: Idle poll interval while waiting for the next scheduled arrival.
+    poll_seconds: float = 0.0005
+    #: Abort a run that exceeds this, so a pathological configuration fails
+    #: fast instead of hanging a benchmark sweep.
+    timeout_seconds: float = 900.0
+    verbose: bool = True
+
+
+def warmup(engine, cfg: RunnerConfig, vocab_size: int) -> None:
+    """Run throwaway requests until the hardware is at steady state."""
+    import numpy as np
+
+    rng = np.random.default_rng(1234)
+    reqs = [
+        Request(
+            prompt_token_ids=[int(x) for x in rng.integers(1, vocab_size - 1, cfg.warmup_prompt_len)],
+            params=SamplingParams(max_tokens=cfg.warmup_output_len, ignore_eos=True),
+        )
+        for _ in range(cfg.warmup_requests)
+    ]
+    for r in reqs:
+        engine.add_request(r)
+    while engine.has_work():
+        engine.step()
+
+    engine.finished.clear()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def run(
+    engine,
+    requests: list[Request],
+    workload_summary: dict,
+    cfg: RunnerConfig | None = None,
+    vocab_size: int = 8192,
+) -> RunResult:
+    """Submit `requests` on schedule and drive the engine until all finish."""
+    cfg = cfg or RunnerConfig()
+
+    if cfg.verbose:
+        print(f"  warming up ({cfg.warmup_requests} requests)...", flush=True)
+    warmup(engine, cfg, vocab_size)
+
+    pending = deque(requests)
+    t0 = time.perf_counter()
+    # Arrival times come from the workload as offsets from zero; rebase them
+    # onto the wall clock so latencies are measured against real submission.
+    for r in requests:
+        r.arrival_time += t0
+        if r.deadline is not None:
+            r.deadline += t0
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    completed: list[Request] = []
+    last_report = t0
+
+    while pending or engine.has_work():
+        now = time.perf_counter()
+
+        if now - t0 > cfg.timeout_seconds:
+            raise TimeoutError(
+                f"run exceeded {cfg.timeout_seconds}s with "
+                f"{len(pending)} unsubmitted and {len(completed)} completed"
+            )
+
+        while pending and pending[0].arrival_time <= now:
+            engine.add_request(pending.popleft())
+
+        if engine.has_work():
+            completed.extend(engine.step())
+        elif pending:
+            # Nothing to do until the next arrival. Sleep rather than spin, so
+            # the benchmark process does not compete with the engine for CPU.
+            time.sleep(min(cfg.poll_seconds, max(0.0, pending[0].arrival_time - now)))
+
+        if cfg.verbose and now - last_report > 5.0:
+            last_report = now
+            print(
+                f"    {len(completed):>5,}/{len(requests):,} done, "
+                f"{len(pending):>5,} not yet arrived, {now - t0:6.1f}s",
+                flush=True,
+            )
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+
+    return RunResult(
+        engine=engine.name,
+        wall_seconds=wall,
+        requests=completed,
+        workload=workload_summary,
+        extra={},
+    )

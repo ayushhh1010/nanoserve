@@ -1,0 +1,130 @@
+{
+  "environment": {
+    "timestamp": "2026-09-08T11:35:37+00:00",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python": "3.11.9",
+    "torch": "2.11.0+cu128",
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "gpu_memory_gb": 4.0,
+    "compute_capability": "8.6",
+    "sm_count": 16,
+    "cuda": "12.8",
+    "cudnn": 91900,
+    "driver_version": "592.82",
+    "enforced.power.limit": "30.00 W",
+    "power.default_limit": "60.00 W",
+    "clocks.max.sm": "2100 MHz",
+    "clocks.sm": "1267 MHz",
+    "triton": "3.8.0"
+  },
+  "result": {
+    "engine": "baseline",
+    "wall_seconds": 28.8332,
+    "counts": {
+      "submitted": 30,
+      "completed": 30,
+      "rejected": 0,
+      "prompt_tokens": 5877,
+      "output_tokens": 3007
+    },
+    "throughput": {
+      "output_tokens_per_s": 104.28946307300788,
+      "total_tokens_per_s": 308.11692382460996,
+      "requests_per_s": 1.0404668746891375
+    },
+    "goodput": {
+      "requests_per_s": 0.27745783325043666,
+      "fraction_met_slo": 0.26666666666666666,
+      "rejection_rate": 0.0
+    },
+    "latency_s": {
+      "ttft": {
+        "p50": 14.155094599998847,
+        "p90": 24.147107789997246,
+        "p95": 25.667535879998827,
+        "p99": 26.478250094999456,
+        "mean": 14.434085289998864,
+        "min": 0.016692999997758307,
+        "max": 26.590031899999303,
+        "n": 30
+      },
+      "e2e": {
+        "p50": 14.546950099997048,
+        "p90": 25.118416929999512,
+        "p95": 26.407833310000203,
+        "p99": 28.18008023800154,
+        "mean": 15.384920449999239,
+        "min": 0.5187358999974094,
+        "max": 28.833104500001355,
+        "n": 30
+      },
+      "queue": {
+        "p50": 14.14565169999696,
+        "p90": 24.13738474999991,
+        "p95": 25.65716666999869,
+        "p99": 26.469558523000522,
+        "mean": 14.423873739999301,
+        "min": 4.649999755201861e-05,
+        "max": 26.58134810000047,
+        "n": 30
+      },
+      "inter_token": {
+        "p50": 0.008883499998773914,
+        "p90": 0.012226580003334675,
+        "p95": 0.013532699998177121,
+        "p99": 0.016609948003024327,
+        "mean": 0.009481187571388527,
+        "min": 0.006640899999183603,
+        "max": 0.037732700002379715,
+        "n": 2977
+      },
+      "per_output_token": {
+        "p50": 0.1802743290697619,
+        "p90": 0.518999634880865,
+        "p95": 0.5984638923301144,
+        "p99": 1.4642675863676855,
+        "mean": 0.2786127147552521,
+        "min": 0.010171292156811949,
+        "max": 1.7975401923076089,
+        "n": 30
+      }
+    },
+    "workload": {
+      "num_requests": 30,
+      "prompt_tokens": 5877,
+      "output_tokens": 3007,
+      "prompt_len": {
+        "mean": 195.9,
+        "p50": 211.0,
+        "p99": 365.13,
+        "max": 366
+      },
+      "output_len": {
+        "mean": 100.23333333333333,
+        "p50": 83.0,
+        "p99": 245.33,
+        "max": 252
+      },
+      "arrival_span_s": 0.0,
+      "effective_rate": null
+    },
+    "extra": {}
+  },
+  "workload_config": {
+    "num_requests": 30,
+    "request_rate": null,
+    "num_prefixes": 16,
+    "prefix_len": 128,
+    "zipf_alpha": 1.0,
+    "prefix_fraction": 0.8,
+    "prompt_len_mean": 96,
+    "prompt_len_sigma": 0.6,
+    "output_len_mean": 64,
+    "output_len_sigma": 0.7,
+    "output_len_min": 8,
+    "output_len_max": 512,
+    "slo_seconds": 10.0,
+    "seed": 0
+  }
+}

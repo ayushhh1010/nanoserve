@@ -10,7 +10,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["model"]  # "engine" joins this list once Phase 2 has code
+packages = ["model", "engine", "bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,196 @@
+"""Turning a finished run into numbers, and recording what produced them.
+
+Percentiles, never means alone. A mean latency hides the tail completely, and
+the tail is the entire subject of this phase: an engine that halves the median
+while tripling p99 has made the service worse, and a single average would call
+that an improvement.
+
+`environment()` records more than is conventional, because this project has
+already been bitten twice by a number that was correct but not comparable. A
+benchmark run on battery measured 18,800 tok/s; the identical code on AC power
+measured 29,400. Nothing in a results file that records only "RTX 3050" would
+let you tell those two runs apart six weeks later. So the enforced power limit,
+the clocks and the driver version go in the file.
+"""
+
+from __future__ import annotations
+
+import json
+import platform
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+
+from engine.types import FinishReason, Request
+
+
+def percentiles(values: list[float], ps=(50, 90, 95, 99)) -> dict:
+    if not values:
+        return {f"p{p}": None for p in ps} | {"mean": None, "min": None, "max": None, "n": 0}
+    a = np.asarray(values, dtype=float)
+    out = {f"p{p}": float(np.percentile(a, p)) for p in ps}
+    out |= {"mean": float(a.mean()), "min": float(a.min()), "max": float(a.max()), "n": int(a.size)}
+    return out
+
+
+@dataclass
+class RunResult:
+    engine: str
+    wall_seconds: float
+    requests: list[Request]
+    workload: dict
+    extra: dict
+
+    def summary(self) -> dict:
+        done = [r for r in self.requests if r.finish_reason in (FinishReason.EOS, FinishReason.LENGTH)]
+        rejected = [r for r in self.requests if r.finish_reason is FinishReason.REJECTED]
+
+        out_tokens = sum(r.output_len for r in done)
+        prompt_tokens = sum(r.prompt_len for r in done)
+
+        ttfts = [r.ttft for r in done if r.ttft is not None]
+        e2es = [r.e2e_latency for r in done if r.e2e_latency is not None]
+        queues = [r.queue_time for r in done if r.queue_time is not None]
+        itls = [x for r in done for x in r.inter_token_latencies]
+
+        # Normalised per-request latency: end-to-end divided by tokens
+        # produced. Lets a 500-token request and a 10-token one be compared,
+        # which raw e2e latency cannot do.
+        norm = [
+            r.e2e_latency / r.output_len
+            for r in done
+            if r.e2e_latency is not None and r.output_len
+        ]
+
+        met = [r for r in done if r.met_deadline]
+
+        return {
+            "engine": self.engine,
+            "wall_seconds": round(self.wall_seconds, 4),
+            "counts": {
+                "submitted": len(self.requests),
+                "completed": len(done),
+                "rejected": len(rejected),
+                "prompt_tokens": prompt_tokens,
+                "output_tokens": out_tokens,
+            },
+            "throughput": {
+                "output_tokens_per_s": out_tokens / self.wall_seconds if self.wall_seconds else 0,
+                "total_tokens_per_s": (prompt_tokens + out_tokens) / self.wall_seconds
+                if self.wall_seconds
+                else 0,
+                "requests_per_s": len(done) / self.wall_seconds if self.wall_seconds else 0,
+            },
+            "goodput": {
+                # Requests completed within SLO, per second. The headline
+                # metric: throughput counts work done, goodput counts work
+                # that was still useful when it finished.
+                "requests_per_s": len(met) / self.wall_seconds if self.wall_seconds else 0,
+                "fraction_met_slo": len(met) / len(done) if done else 0.0,
+                "rejection_rate": len(rejected) / len(self.requests) if self.requests else 0.0,
+            },
+            "latency_s": {
+                "ttft": percentiles(ttfts),
+                "e2e": percentiles(e2es),
+                "queue": percentiles(queues),
+                "inter_token": percentiles(itls),
+                "per_output_token": percentiles(norm),
+            },
+            "workload": self.workload,
+            "extra": self.extra,
+        }
+
+
+def _nvidia_smi(fields: str) -> dict:
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout.strip().splitlines()[0]
+        return dict(zip(fields.split(","), [v.strip() for v in out.split(",")]))
+    except Exception:
+        return {}
+
+
+def environment() -> dict:
+    """Everything needed to know whether two results are comparable."""
+    import torch
+
+    env = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "platform": platform.platform(),
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        env |= {
+            "gpu": props.name,
+            "gpu_memory_gb": round(props.total_memory / 1024**3, 2),
+            "compute_capability": f"{props.major}.{props.minor}",
+            "sm_count": props.multi_processor_count,
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+        }
+        # The fields that made two correct measurements look contradictory.
+        env |= _nvidia_smi(
+            "driver_version,enforced.power.limit,power.default_limit,clocks.max.sm,clocks.sm"
+        )
+    try:
+        import triton
+
+        env["triton"] = triton.__version__
+    except ImportError:
+        env["triton"] = None
+    return env
+
+
+def save_result(result: RunResult, path: Path, extra: dict | None = None) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "environment": environment(),
+        "result": result.summary(),
+        **(extra or {}),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def format_summary(summary: dict) -> str:
+    """A compact human-readable block, printed after every run."""
+    c, t, g, lat = summary["counts"], summary["throughput"], summary["goodput"], summary["latency_s"]
+
+    def ms(d, key):
+        """Milliseconds, 9 wide. Queue waits under overload run to five
+        figures, and a narrower field silently runs the columns together."""
+        v = d.get(key)
+        return f"{'-':>9}" if v is None else f"{v * 1000:9.1f}"
+
+    lines = [
+        f"  engine            {summary['engine']}",
+        f"  wall              {summary['wall_seconds']:.2f} s",
+        f"  completed         {c['completed']:,} / {c['submitted']:,}"
+        + (f"  ({c['rejected']:,} rejected)" if c["rejected"] else ""),
+        f"  output tokens     {c['output_tokens']:,}",
+        "",
+        f"  throughput        {t['output_tokens_per_s']:>9,.0f} output tok/s"
+        f"   ({t['requests_per_s']:.2f} req/s)",
+        f"  goodput           {g['requests_per_s']:>9.2f} req/s within SLO"
+        f"   ({g['fraction_met_slo'] * 100:.1f}% met)",
+        "",
+        f"  {'':18}{'p50':>9}{'p90':>9}{'p99':>9}{'max':>9}   (ms)",
+        f"  TTFT              {ms(lat['ttft'], 'p50')}{ms(lat['ttft'], 'p90')}"
+        f"{ms(lat['ttft'], 'p99')}{ms(lat['ttft'], 'max')}",
+        f"  inter-token       {ms(lat['inter_token'], 'p50')}{ms(lat['inter_token'], 'p90')}"
+        f"{ms(lat['inter_token'], 'p99')}{ms(lat['inter_token'], 'max')}",
+        f"  end-to-end        {ms(lat['e2e'], 'p50')}{ms(lat['e2e'], 'p90')}"
+        f"{ms(lat['e2e'], 'p99')}{ms(lat['e2e'], 'max')}",
+        f"  queue wait        {ms(lat['queue'], 'p50')}{ms(lat['queue'], 'p90')}"
+        f"{ms(lat['queue'], 'p99')}{ms(lat['queue'], 'max')}",
+    ]
+    return "\n".join(lines)

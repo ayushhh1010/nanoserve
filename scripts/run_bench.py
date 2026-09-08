@@ -1,0 +1,120 @@
+"""Run a benchmark against an engine and write a results file.
+
+    python scripts/run_bench.py --engine baseline-nocache --requests 40
+    python scripts/run_bench.py --engine baseline --rate 4 --requests 200
+
+Named run_bench rather than bench: a script named bench.py sits in scripts/,
+which Python puts first on sys.path, so `import bench.metrics` would resolve to
+the script itself rather than the package.
+
+Results land in bench/results/ as JSON with the full environment attached, so a
+number can always be traced back to the machine state that produced it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+
+from bench.metrics import format_summary, save_result
+from bench.runner import RunnerConfig, run
+from bench.workload import WorkloadConfig, build_workload, load_prompt_pool, summarise
+from engine.baseline import BaselineEngine
+from model.generate import load_model
+from model.tokenizer import BPETokenizer
+
+ROOT = Path(__file__).resolve().parent.parent
+
+ENGINES = {
+    "baseline": dict(use_cache=True),
+    "baseline-nocache": dict(use_cache=False),
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--engine", choices=list(ENGINES), default="baseline")
+    ap.add_argument("--checkpoint", type=Path, default=ROOT / "checkpoints/run1/best.pt")
+    ap.add_argument("--tokenizer", type=Path, default=ROOT / "model/tokenizer.json")
+    ap.add_argument("--corpus", type=Path, default=ROOT / "data/TinyStoriesV2-GPT4-valid.txt")
+
+    ap.add_argument("--requests", type=int, default=200)
+    ap.add_argument("--rate", type=float, default=None,
+                    help="requests/sec (Poisson). Omit for all-at-once throughput mode.")
+    ap.add_argument("--output-len", type=int, default=96, help="median output length")
+    ap.add_argument("--prompt-len", type=int, default=96, help="median unique prompt length")
+    ap.add_argument("--prefixes", type=int, default=16)
+    ap.add_argument("--zipf", type=float, default=1.0)
+    ap.add_argument("--slo", type=float, default=10.0)
+    ap.add_argument("--seed", type=int, default=0)
+
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--warmup", type=int, default=12)
+    ap.add_argument("--synthetic", action="store_true",
+                    help="use random token ids instead of real text")
+    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--tag", default="", help="suffix for the results filename")
+    args = ap.parse_args()
+
+    for p in (args.checkpoint, args.tokenizer):
+        if not p.exists():
+            print(f"missing {p}", file=sys.stderr)
+            return 1
+
+    tok = BPETokenizer.load(args.tokenizer)
+    model, meta = load_model(args.checkpoint, device=args.device, dtype=getattr(torch, args.dtype))
+    print(f"model: {model.num_parameters():,} params, step {meta.get('step')}, "
+          f"val {meta.get('best_val')}")
+
+    pool = None
+    if not args.synthetic and args.corpus.exists():
+        pool = load_prompt_pool(args.corpus, tok)
+        print(f"prompt pool: {len(pool)} real documents")
+
+    wcfg = WorkloadConfig(
+        num_requests=args.requests,
+        request_rate=args.rate,
+        num_prefixes=args.prefixes,
+        zipf_alpha=args.zipf,
+        prompt_len_mean=args.prompt_len,
+        output_len_mean=args.output_len,
+        slo_seconds=args.slo,
+        seed=args.seed,
+    )
+    requests = build_workload(wcfg, tok.vocab_size, tok.eos_id, pool)
+    wsummary = summarise(requests)
+    print(
+        f"workload: {wsummary['num_requests']:,} requests, "
+        f"{wsummary['output_tokens']:,} output tokens, "
+        f"rate={'burst' if args.rate is None else f'{args.rate}/s'}"
+    )
+
+    engine = BaselineEngine(
+        model, eos_token_id=tok.eos_id, device=args.device, **ENGINES[args.engine]
+    )
+    engine.name = args.engine
+
+    result = run(
+        engine, requests, wsummary,
+        RunnerConfig(warmup_requests=args.warmup), vocab_size=tok.vocab_size,
+    )
+
+    summary = result.summary()
+    print()
+    print(format_summary(summary))
+
+    name = args.tag or f"{args.engine}_n{args.requests}" + (
+        f"_r{args.rate:g}" if args.rate else "_burst"
+    )
+    out = args.out or ROOT / "bench" / "results" / f"{name}.json"
+    save_result(result, out, extra={"workload_config": wcfg.to_dict()})
+    print(f"\nwrote {out.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
