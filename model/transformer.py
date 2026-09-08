@@ -141,6 +141,16 @@ class KVCache(Protocol):
         """Append this step's K/V for `layer_idx`, return the full K/V so far."""
         ...
 
+    def __len__(self) -> int:
+        """Tokens already cached, so RoPE knows where this step sits.
+
+        Part of the protocol rather than an implementation detail: a cache that
+        cannot report its length makes the model compute positions from zero on
+        every decode step, which produces fluent, subtly wrong output rather
+        than an error.
+        """
+        ...
+
 
 class DynamicCache:
     """The naive cache: one growing contiguous tensor per layer.
@@ -344,7 +354,11 @@ class NanoModel(nn.Module):
         b, t = input_ids.shape
         if position_ids is None:
             # `len(cache)` is a shape read, not a device read -- no sync here.
-            past = len(cache) if isinstance(cache, DynamicCache) else 0
+            # Asking the protocol rather than testing for a concrete class: an
+            # `isinstance(cache, DynamicCache)` check here silently gave every
+            # other cache implementation past=0, restarting RoPE positions on
+            # every decode step. That produces fluent, wrong output, not an error.
+            past = len(cache) if cache is not None else 0
             self.rotary.ensure_capacity(past + t)
             position_ids = torch.arange(past, past + t, device=input_ids.device).expand(b, t)
 

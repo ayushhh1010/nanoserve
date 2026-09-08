@@ -29,8 +29,9 @@ from model.tokenizer import BPETokenizer
 ROOT = Path(__file__).resolve().parent.parent
 
 ENGINES = {
-    "baseline": dict(use_cache=True),
-    "baseline-nocache": dict(use_cache=False),
+    "baseline": dict(use_cache=True),          # cache grows by torch.cat
+    "baseline-nocache": dict(use_cache=False),  # no cache: re-attend every token
+    "baseline-static": dict(use_cache=True),    # preallocated contiguous slot
 }
 
 
@@ -56,6 +57,10 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=12)
     ap.add_argument("--synthetic", action="store_true",
                     help="use random token ids instead of real text")
+    ap.add_argument("--kv-budget-mb", type=int, default=512,
+                    help="KV pool budget for --engine baseline-static")
+    ap.add_argument("--max-seq-len", type=int, default=1024,
+                    help="per-slot reservation for the contiguous pool")
     ap.add_argument("--repeats", type=int, default=1,
                     help="run the identical workload N times and report the spread")
     ap.add_argument("--out", type=Path, default=None)
@@ -72,10 +77,10 @@ def main() -> int:
     print(f"model: {model.num_parameters():,} params, step {meta.get('step')}, "
           f"val {meta.get('best_val')}")
 
-    pool = None
+    prompt_pool = None
     if not args.synthetic and args.corpus.exists():
-        pool = load_prompt_pool(args.corpus, tok)
-        print(f"prompt pool: {len(pool)} real documents")
+        prompt_pool = load_prompt_pool(args.corpus, tok)
+        print(f"prompt pool: {len(prompt_pool)} real documents")
 
     wcfg = WorkloadConfig(
         num_requests=args.requests,
@@ -87,7 +92,7 @@ def main() -> int:
         slo_seconds=args.slo,
         seed=args.seed,
     )
-    requests = build_workload(wcfg, tok.vocab_size, tok.eos_id, pool)
+    requests = build_workload(wcfg, tok.vocab_size, tok.eos_id, prompt_pool)
     wsummary = summarise(requests)
     print(
         f"workload: {wsummary['num_requests']:,} requests, "
@@ -95,18 +100,32 @@ def main() -> int:
         f"rate={'burst' if args.rate is None else f'{args.rate}/s'}"
     )
 
+    def make_kv_pool():
+        from engine.kv_cache import StaticCachePool, slots_for_budget
+
+        budget = args.kv_budget_mb * 1024 * 1024
+        n = slots_for_budget(model.cfg, budget, args.max_seq_len)
+        kv = StaticCachePool(
+            model.cfg, num_slots=n, max_seq_len=args.max_seq_len,
+            device=args.device, dtype=getattr(torch, args.dtype),
+        )
+        print(f"kv pool: {kv}")
+        return kv
+
     summaries = []
     for rep in range(args.repeats):
         if args.repeats > 1:
             print(f"\n--- repeat {rep + 1}/{args.repeats} ---", flush=True)
         engine = BaselineEngine(
-            model, eos_token_id=tok.eos_id, device=args.device, **ENGINES[args.engine]
+            model, eos_token_id=tok.eos_id, device=args.device,
+            pool=make_kv_pool() if args.engine == "baseline-static" else None,
+            **ENGINES[args.engine],
         )
         engine.name = args.engine
         # Rebuild the workload each repeat: Request objects carry mutable
         # timing state, so reusing them would measure the second run against
         # the first run's timestamps.
-        reqs = build_workload(wcfg, tok.vocab_size, tok.eos_id, pool)
+        reqs = build_workload(wcfg, tok.vocab_size, tok.eos_id, prompt_pool)
         result = run(
             engine, reqs, wsummary,
             RunnerConfig(warmup_requests=args.warmup, verbose=args.repeats == 1),

@@ -1,0 +1,34 @@
+{
+  "config": {
+    "budget_mb": 512,
+    "max_seq_len": 1024,
+    "block_size": 16,
+    "slots": 128,
+    "kv_bytes_per_token": 4096
+  },
+  "workload": {
+    "sequences": 400,
+    "mean_len": 338.9225,
+    "p50": 318.5,
+    "p99": 730.2199999999998
+  },
+  "contiguous_measured": {
+    "steps": 1508,
+    "mean_slots_allocated": 89.89986737400531,
+    "mean_utilization": 0.27617891508068165,
+    "mean_occupancy": 0.13290842901174207,
+    "mean_waste_fraction": 0.7238210849193183,
+    "mean_tokens_used": 17420.573607427057,
+    "mean_internal_frag": 57306.21684350132,
+    "mean_reserved": 17330.67374005305,
+    "mean_external_frag": 39014.53580901857
+  },
+  "paged_analytic": {
+    "block_size": 16,
+    "mean_waste_tokens_per_seq": 7.5975,
+    "max_waste_tokens_per_seq": 15,
+    "waste_fraction": 0.021925141405979454,
+    "external_fragmentation": 0
+  },
+  "usable_capacity_gain": 3.5414537648838618
+}

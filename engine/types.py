@@ -92,6 +92,16 @@ class Request:
     def total_len(self) -> int:
         return self.prompt_len + self.output_len
 
+    @property
+    def total_len_estimate(self) -> int:
+        """Longest this sequence can become: prompt plus its token budget.
+
+        What a contiguous allocator must reserve, since it cannot know where
+        the sequence will actually stop. The gap between this and `total_len`
+        at completion is precisely the internal fragmentation being measured.
+        """
+        return self.prompt_len + self.params.max_tokens
+
     def record_token(self, token_id: int, now: float | None = None) -> None:
         now = time.perf_counter() if now is None else now
         if not self.output_token_ids:

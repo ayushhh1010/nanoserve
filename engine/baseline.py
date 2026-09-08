@@ -31,6 +31,7 @@ from collections import deque
 import torch
 import torch.nn.functional as F
 
+from engine.kv_cache import StaticCachePool
 from engine.types import EngineStats, FinishReason, Request
 from model.transformer import DynamicCache, NanoForCausalLM
 
@@ -46,11 +47,16 @@ class BaselineEngine:
         eos_token_id: int,
         device: str = "cuda",
         use_cache: bool = True,
+        pool: StaticCachePool | None = None,
     ) -> None:
         self.model = model.eval()
         self.eos_token_id = eos_token_id
         self.device = torch.device(device)
         self.use_cache = use_cache
+        # When a pool is supplied, sequences take a preallocated contiguous
+        # slot instead of a cache that grows by torch.cat. The paged engine
+        # swaps this for a block pool and nothing else in the loop changes.
+        self.pool = pool
 
         self.waiting: deque[Request] = deque()
         self.finished: list[Request] = []
@@ -65,12 +71,17 @@ class BaselineEngine:
         return bool(self.waiting)
 
     def stats(self) -> EngineStats:
-        return EngineStats(
+        stats = EngineStats(
             timestamp=time.perf_counter(),
             num_running=0,
             num_waiting=len(self.waiting),
             num_finished=len(self.finished),
         )
+        if self.pool is not None:
+            p = self.pool.stats()
+            stats.kv_blocks_used = p.tokens_used
+            stats.kv_blocks_total = p.tokens_capacity
+        return stats
 
     # -- execution ----------------------------------------------------------
 
@@ -90,7 +101,18 @@ class BaselineEngine:
         req = self.waiting.popleft()
         req.scheduled_time = time.perf_counter()
 
-        cache = DynamicCache() if self.use_cache else None
+        cache = None
+        if self.use_cache:
+            if self.pool is not None:
+                cache = self.pool.allocate(expected_len=req.total_len_estimate)
+                if cache is None:
+                    # A full pool is a scheduling condition. This engine has
+                    # nowhere to put the request, so it goes back on the queue;
+                    # week 7 turns this into a deliberate admission decision.
+                    self.waiting.appendleft(req)
+                    return []
+            else:
+                cache = DynamicCache()
 
         if self.use_cache:
             prompt = torch.tensor([req.prompt_token_ids], device=self.device)
@@ -140,6 +162,12 @@ class BaselineEngine:
 
         if req.finish_reason is None:
             req.finish(FinishReason.LENGTH)
+
+        if self.pool is not None and cache is not None:
+            # Freeing on completion is what makes the slot reusable. Missing
+            # this is the classic serving leak: the pool drains, throughput
+            # falls to zero, and nothing errors.
+            self.pool.free(cache)
 
         self.finished.append(req)
         return [req]
