@@ -266,7 +266,10 @@ class PagedKVCache:
         # writes to the same physical slots.
         if layer_idx == 0:
             self._start = self.num_tokens
-            if self.num_tokens % self.pool.block_size != 0 or n == 0:
+            # Only a partially filled tail block can need copy-on-write. When
+            # the sequence ends exactly on a boundary the next token opens a
+            # fresh block, so there is nothing shared to copy.
+            if self.num_tokens % self.pool.block_size != 0:
                 self._unshare_tail()
             self._ensure_capacity(n)
             self.num_tokens += n
@@ -354,9 +357,28 @@ class PagedCachePool:
 
     # -- operations ---------------------------------------------------------
 
-    def allocate(self, **_) -> PagedKVCache:
-        """A new, empty sequence. Blocks are taken lazily as it grows."""
+    def allocate(self, expected_len: int | None = None, **_) -> PagedKVCache | None:
+        """A new sequence, or None when the pool cannot even start one.
+
+        Returns None rather than a doomed cache, matching StaticCachePool's
+        contract so the scheduler has one way to ask "is there room?". Only
+        one block is required up front -- paging exists so capacity is not
+        reserved for the worst case -- but a pool with zero free blocks cannot
+        make progress and should say so here instead of raising OutOfBlocks
+        several layers into a forward pass.
+        """
+        if self.allocator.num_free == 0:
+            return None
         return PagedKVCache(self)
+
+    def can_fit(self, num_tokens: int) -> bool:
+        """Whether `num_tokens` could be admitted right now.
+
+        Used by admission control in week 7, which needs to decide before
+        committing rather than discover mid-generation.
+        """
+        needed = -(-num_tokens // self.block_size)
+        return self.allocator.num_free >= needed
 
     def copy_block(self, src: int, dst: int) -> None:
         """Duplicate a block's contents across every layer. The COW copy."""

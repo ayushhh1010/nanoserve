@@ -19,7 +19,13 @@ from pathlib import Path
 
 import torch
 
-from bench.metrics import aggregate, format_repeats, format_summary, save_result
+from bench.metrics import (
+    RunResult,
+    aggregate,
+    format_repeats,
+    format_summary,
+    save_result,
+)
 from bench.runner import RunnerConfig, run
 from bench.workload import WorkloadConfig, build_workload, load_prompt_pool, summarise
 from engine.baseline import BaselineEngine
@@ -144,8 +150,11 @@ def main() -> int:
         )
         summaries.append(result.summary())
 
-    summary = summaries[len(summaries) // 2]
     agg = aggregate(summaries)
+    # Report and save the SAME run. Previously the printed block was the
+    # middle repeat while the saved JSON held the last one, so a results file
+    # never matched the numbers anyone had actually looked at.
+    summary = agg["representative"]
     print()
     print(format_summary(summary))
     if args.repeats > 1:
@@ -155,7 +164,12 @@ def main() -> int:
         f"_r{args.rate:g}" if args.rate else "_burst"
     )
     out = args.out or ROOT / "bench" / "results" / f"{name}.json"
-    save_result(result, out, extra={"workload_config": wcfg.to_dict(), "repeats": agg})
+    save_result(
+        RunResult(engine=summary["engine"], wall_seconds=summary["wall_seconds"],
+                  requests=[], workload=wsummary, extra={}),
+        out,
+        extra={"workload_config": wcfg.to_dict(), "repeats": agg, "result": summary},
+    )
     print(f"\nwrote {out.relative_to(ROOT)}")
     return 0
 

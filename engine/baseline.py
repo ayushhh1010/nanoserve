@@ -31,7 +31,7 @@ from collections import deque
 import torch
 import torch.nn.functional as F
 
-from engine.block_manager import PagedCachePool
+from engine.block_manager import OutOfBlocks, PagedCachePool
 from engine.kv_cache import StaticCachePool
 from engine.types import EngineStats, FinishReason, Request
 from model.transformer import DynamicCache, NanoForCausalLM
@@ -139,6 +139,33 @@ class BaselineEngine:
             buffer[0, :n_prompt] = torch.tensor(req.prompt_token_ids, device=self.device)
             logits, _ = self.model(buffer[:, :n_prompt])
 
+        try:
+            self._generate(req, logits, cache, buffer)
+        except OutOfBlocks:
+            # The pool cannot hold this sequence. For a sequential engine no
+            # amount of waiting helps -- nothing else is running to free
+            # anything -- so the request fails with whatever it produced.
+            # Step 5 (preemption) turns this into a recoverable event by
+            # evicting a victim instead.
+            req.finish(FinishReason.PREEMPTED)
+        finally:
+            # Freeing must happen on every path, including the failing one.
+            # Without this the pool drains one request at a time, throughput
+            # decays to zero, and nothing raises to say why.
+            if cache is not None and self.pool is not None:
+                if isinstance(self.pool, PagedCachePool):
+                    cache.free()
+                else:
+                    self.pool.free(cache)
+
+        if req.finish_reason is None:
+            req.finish(FinishReason.LENGTH)
+
+        self.finished.append(req)
+        return [req]
+
+    def _generate(self, req: Request, logits, cache, buffer) -> None:
+        """The decode loop. Raises OutOfBlocks if the pool runs dry."""
         for _ in range(req.params.max_tokens):
             token = self._sample(logits[:, -1], req)
 
@@ -150,7 +177,7 @@ class BaselineEngine:
 
             if token_id == self.eos_token_id and not req.params.ignore_eos:
                 req.finish(FinishReason.EOS)
-                break
+                return
 
             req.record_token(token_id)
             self._tokens_generated += 1
@@ -165,21 +192,6 @@ class BaselineEngine:
                 end = req.prompt_len + req.output_len
                 buffer[0, end - 1] = token
                 logits, _ = self.model(buffer[:, :end])
-
-        if req.finish_reason is None:
-            req.finish(FinishReason.LENGTH)
-
-        if self.pool is not None and cache is not None:
-            # Freeing on completion is what makes the memory reusable. Missing
-            # this is the classic serving leak: the pool drains, throughput
-            # falls to zero, and nothing errors.
-            if isinstance(self.pool, PagedCachePool):
-                cache.free()  # blocks go back via refcount
-            else:
-                self.pool.free(cache)
-
-        self.finished.append(req)
-        return [req]
 
     def _sample(self, logits: torch.Tensor, req: Request) -> torch.Tensor:
         p = req.params

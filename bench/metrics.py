@@ -175,7 +175,7 @@ def aggregate(summaries: list[dict]) -> dict:
     comparison should not be trusted.
     """
     if len(summaries) == 1:
-        return {"repeats": 1, "median": summaries[0], "stable": True}
+        return {"repeats": 1, "representative": summaries[0], "stable": True}
 
     def pluck(path: tuple[str, ...]) -> list[float]:
         out = []
@@ -221,9 +221,17 @@ def aggregate(summaries: list[dict]) -> dict:
         if not name.endswith("p99"):
             worst_cv = max(worst_cv, cv)
 
+    # The representative run is the one whose throughput is the median, not
+    # whichever happened to execute in the middle. Picking by order would
+    # report a 300 tok/s run as the "median" of [100, 300, 200].
+    by_throughput = sorted(
+        summaries, key=lambda s: s["throughput"]["output_tokens_per_s"]
+    )
+    representative = by_throughput[len(by_throughput) // 2]
+
     return {
         "repeats": len(summaries),
-        "median": summaries[len(summaries) // 2],
+        "representative": representative,
         "across_repeats": stats,
         "worst_cv": worst_cv,
         # 5% is tight enough to catch a thermal ramp or a power-state change,
