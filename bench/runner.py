@@ -54,6 +54,10 @@ def warmup(engine, cfg: RunnerConfig, vocab_size: int) -> None:
         )
         for _ in range(cfg.warmup_requests)
     ]
+    # Submit everything before stepping. A batching engine warmed one request
+    # at a time never runs its batched path, so the first measured steps pay
+    # the allocator and kernel-selection costs the warm-up was supposed to
+    # absorb -- which showed up as a 2.5x spread across repeats.
     for r in reqs:
         engine.add_request(r)
     while engine.has_work():
