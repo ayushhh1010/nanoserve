@@ -43,6 +43,7 @@ from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
 from engine.block_manager import OutOfBlocks, PagedCachePool, PagedKVCache
+from engine.prefix_cache import PrefixCache
 from engine.types import EngineStats, FinishReason, Request
 from model.transformer import NanoForCausalLM
 
@@ -214,6 +215,9 @@ class ContinuousBatchingEngine:
         #: headroom below `len(running)` lets admission starve the batch it
         #: just joined. A fixed reserve looks fine until the batch outgrows it.
         reserve_blocks: int = 8,
+        #: Reuse KV blocks across requests sharing a prefix. Off gives the
+        #: same engine without the cache, which is the honest comparison.
+        enable_prefix_cache: bool = True,
     ) -> None:
         self.model = model.eval()
         self.pool = pool
@@ -221,6 +225,8 @@ class ContinuousBatchingEngine:
         self.device = torch.device(device)
         self.max_batch_size = max_batch_size
         self.reserve_blocks = reserve_blocks
+
+        self.prefix_cache = PrefixCache(pool, enabled=enable_prefix_cache)
 
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
@@ -246,6 +252,8 @@ class ContinuousBatchingEngine:
             num_finished=len(self.finished),
             kv_blocks_used=a.num_allocated,
             kv_blocks_total=a.num_blocks,
+            prefix_cache_hits=self.prefix_cache.stats.hit_blocks,
+            prefix_cache_queries=self.prefix_cache.stats.query_blocks,
         )
 
     # -- scheduling ---------------------------------------------------------
@@ -271,7 +279,10 @@ class ContinuousBatchingEngine:
             # One spare block per already-running sequence, plus the floor.
             reserve = max(self.reserve_blocks, len(self.running) + len(admitted) + 1)
             if self.pool.allocator.num_free < need + reserve:
-                break
+                # Cached prefixes are the first thing to give up: they are an
+                # optimisation, and a request that cannot start is not.
+                if not self.prefix_cache.ensure_free(need + reserve):
+                    break
             if (
                 not self.running
                 and not admitted
@@ -293,8 +304,7 @@ class ContinuousBatchingEngine:
                 break
 
             try:
-                prompt = torch.tensor([req.prompt_token_ids], device=self.device)
-                logits, _ = self.model(prompt, cache=cache)
+                logits = self._prefill(req, cache)
                 token = self._sample(logits[:, -1], req)
             except OutOfBlocks:
                 cache.free()
@@ -310,6 +320,40 @@ class ContinuousBatchingEngine:
             else:
                 done.append(self._retire(seq))
         return admitted, done
+
+    def _prefill(self, req: Request, cache: PagedKVCache) -> Tensor:
+        """Run the prompt, skipping any prefix already in the block cache.
+
+        The cached blocks are attached to the sequence and only the remaining
+        suffix goes through the model. Positions continue from where the cache
+        left off, so the suffix sees exactly the context it would have seen in
+        a full prefill -- which is why the reused blocks have to have been
+        produced by an identical prefix, and why the hash is chained.
+
+        The last token of the prompt is never served from cache. The model has
+        to produce logits for it to sample the first output token, and a fully
+        cached prompt would leave nothing to run.
+        """
+        ids = req.prompt_token_ids
+        reusable = ids[:-1]  # always leave one token to feed the model
+
+        blocks = self.prefix_cache.match(reusable)
+        n_cached = self.prefix_cache.attach(cache, blocks)
+
+        suffix = ids[n_cached:]
+        tokens = torch.tensor([suffix], device=self.device)
+        self.model.model.rotary.ensure_capacity(len(ids) + 1)
+        positions = torch.arange(
+            n_cached, n_cached + len(suffix), device=self.device
+        ).unsqueeze(0)
+
+        logits, _ = self.model(tokens, position_ids=positions, cache=cache)
+
+        # Register whatever full blocks this prompt produced, including the
+        # ones just reused -- re-inserting an existing key is a no-op that
+        # refreshes its LRU position.
+        self.prefix_cache.insert(ids, cache.block_table)
+        return logits
 
     def _accept_token(self, seq: Sequence, token_id: int) -> None:
         """Record a produced token and apply stop conditions."""

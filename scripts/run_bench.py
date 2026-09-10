@@ -56,6 +56,10 @@ def main() -> int:
     ap.add_argument("--output-len", type=int, default=96, help="median output length")
     ap.add_argument("--prompt-len", type=int, default=96, help="median unique prompt length")
     ap.add_argument("--prefixes", type=int, default=16)
+    ap.add_argument("--prefix-len", type=int, default=128,
+                    help="tokens in each shared prefix (the system-prompt length)")
+    ap.add_argument("--prefix-fraction", type=float, default=0.8,
+                    help="fraction of requests carrying a shared prefix")
     ap.add_argument("--zipf", type=float, default=1.0)
     ap.add_argument("--slo", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -71,6 +75,8 @@ def main() -> int:
                     help="per-slot reservation for the contiguous pool")
     ap.add_argument("--max-batch-size", type=int, default=64,
                     help="cap on concurrent sequences for --engine continuous")
+    ap.add_argument("--no-prefix-cache", action="store_true",
+                    help="disable prefix-block reuse for --engine continuous")
     ap.add_argument("--reserve-blocks", type=int, default=8,
                     help="floor on KV headroom kept for growing sequences")
     ap.add_argument("--block-size", type=int, default=16,
@@ -100,6 +106,8 @@ def main() -> int:
         num_requests=args.requests,
         request_rate=args.rate,
         num_prefixes=args.prefixes,
+        prefix_len=args.prefix_len,
+        prefix_fraction=args.prefix_fraction,
         zipf_alpha=args.zipf,
         prompt_len_mean=args.prompt_len,
         output_len_mean=args.output_len,
@@ -144,6 +152,7 @@ def main() -> int:
             engine = ContinuousBatchingEngine(
                 model, make_kv_pool(), eos_token_id=tok.eos_id, device=args.device,
                 max_batch_size=args.max_batch_size, reserve_blocks=args.reserve_blocks,
+                enable_prefix_cache=not args.no_prefix_cache,
             )
         else:
             engine = BaselineEngine(

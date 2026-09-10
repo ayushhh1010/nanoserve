@@ -255,9 +255,21 @@ def test_max_tokens_is_exact_for_every_sequence(model):
 
 
 def test_all_blocks_are_returned_after_a_run(model):
+    """Nothing is held except by the prefix cache, which releases on clear.
+
+    Blocks the cache retains are not a leak -- keeping them is the feature.
+    So the assertion is the stronger one: after the cache lets go, the pool is
+    exactly as it started, with every refcount at zero.
+    """
     p = pool()
     e = engine(model, pool=p)
     e.run(build(spec_workload(20, seed=5)))
+
+    assert not e.running and not e.waiting
+    cached = len(e.prefix_cache._entries)
+    assert p.allocator.num_allocated == cached, "blocks held by nothing"
+
+    e.prefix_cache.clear()
     assert p.allocator.num_allocated == 0
     assert all(r == 0 for r in p.allocator._refs)
 
@@ -271,6 +283,7 @@ def test_a_small_pool_still_completes_every_request(model):
 
     assert len(done) == 15
     assert all(r.finish_reason is FinishReason.LENGTH for r in done)
+    e.prefix_cache.clear()
     assert p.allocator.num_allocated == 0
 
 
@@ -294,6 +307,7 @@ def test_memory_pressure_preempts_rather_than_failing(model):
     assert all(r.finish_reason is FinishReason.LENGTH for r in done)
     assert all(r.output_len == 40 for r in done), "a preempted request lost tokens"
     assert e.preemptions > 0, "this configuration should have forced eviction"
+    e.prefix_cache.clear()
     assert p.allocator.num_allocated == 0
 
 
@@ -321,6 +335,7 @@ def test_preempted_output_matches_an_uninterrupted_run(model):
 
     assert e.preemptions > 0, "expected memory pressure in this configuration"
     assert got == ref
+    e.prefix_cache.clear()
     assert p.allocator.num_allocated == 0
 
 
@@ -345,6 +360,7 @@ def test_admission_throttles_instead_of_evicting_when_it_can(model):
 
         assert got == ref, f"wrong output at {num_blocks} blocks"
         assert e.preemptions == 0, f"evicted at {num_blocks} blocks; admission should throttle"
+        e.prefix_cache.clear()
         assert p.allocator.num_allocated == 0
 
 
