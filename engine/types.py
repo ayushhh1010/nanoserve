@@ -79,6 +79,8 @@ class Request:
     token_times: list[float] = field(default_factory=list)
     output_token_ids: list[int] = field(default_factory=list)
     finish_reason: FinishReason | None = None
+    #: Which admission gate turned this away, for the rejection breakdown.
+    rejection_reason: str = ""
 
     @property
     def prompt_len(self) -> int:

@@ -42,6 +42,7 @@ import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
+from engine.admission import AdmissionConfig, AdmissionController
 from engine.block_manager import OutOfBlocks, PagedCachePool, PagedKVCache
 from engine.prefix_cache import PrefixCache
 from engine.types import EngineStats, FinishReason, Request
@@ -218,6 +219,9 @@ class ContinuousBatchingEngine:
         #: Reuse KV blocks across requests sharing a prefix. Off gives the
         #: same engine without the cache, which is the honest comparison.
         enable_prefix_cache: bool = True,
+        #: None disables admission control entirely, which is the naive
+        #: unbounded queue the goodput comparison is made against.
+        admission: AdmissionConfig | None = None,
     ) -> None:
         self.model = model.eval()
         self.pool = pool
@@ -227,10 +231,12 @@ class ContinuousBatchingEngine:
         self.reserve_blocks = reserve_blocks
 
         self.prefix_cache = PrefixCache(pool, enabled=enable_prefix_cache)
+        self.admission = AdmissionController(admission) if admission else None
 
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
         self.finished: list[Request] = []
+        self._rejected: list[Request] = []
         #: How often memory pressure forced an eviction. A healthy server runs
         #: at zero; a non-zero count means the pool is undersized for the load.
         self.preemptions = 0
@@ -238,9 +244,47 @@ class ContinuousBatchingEngine:
     # -- queue --------------------------------------------------------------
 
     def add_request(self, request: Request) -> None:
+        """Admit or reject on arrival.
+
+        The decision happens here rather than at scheduling time because the
+        entire value of a rejection is that it is immediate. A 429 delivered
+        after thirty seconds of queueing has already cost the client the thing
+        it was trying to avoid.
+        """
+        if self.admission is not None:
+            ok, reason = self.admission.admit(
+                request,
+                queue_depth=len(self.waiting),
+                queued_tokens=sum(r.params.max_tokens for r in self.waiting),
+                running_tokens=sum(
+                    s.request.params.max_tokens - s.request.output_len for s in self.running
+                ),
+            )
+            if not ok:
+                request.finish(FinishReason.REJECTED)
+                request.rejection_reason = reason
+                self.finished.append(request)
+                self._rejected.append(request)
+                return
         self.waiting.append(request)
 
+    def drain_rejected(self) -> list[Request]:
+        """Requests turned away since the last call.
+
+        Surfaced separately so the harness can count them without treating a
+        rejection as a completion -- they are the numerator of the rejection
+        rate and must never reach the goodput numerator.
+        """
+        out, self._rejected = self._rejected, []
+        return out
+
     def has_work(self) -> bool:
+        """Is there anything left to *execute*?
+
+        Deliberately excludes pending rejections. They are outcomes to be
+        collected, not work -- and including them made `run()` spin forever,
+        since `step()` has no reason to touch them.
+        """
         return bool(self.waiting or self.running)
 
     def stats(self) -> EngineStats:
@@ -416,6 +460,7 @@ class ContinuousBatchingEngine:
         self.model.model.rotary.ensure_capacity(max(s.position for s in batch) + 1)
 
         cache = BatchedPagedCache(self.pool, batch)
+        step_started = time.perf_counter()
         try:
             logits, _ = self.model(
                 tokens, position_ids=positions, cache=cache, attn_mask=cache_mask(cache)
@@ -437,6 +482,11 @@ class ContinuousBatchingEngine:
         # One host sync per step, not per sequence: stop conditions depend on
         # the token values, so they have to come back to the host once.
         next_ids = self._sample_batch(logits[:, -1], batch).tolist()
+
+        # That sync makes this a real elapsed time rather than a queue-depth
+        # measurement, so it is safe to feed the throughput estimate.
+        if self.admission is not None:
+            self.admission.record_step(time.perf_counter() - step_started, len(batch))
 
         done: list[Request] = list(done_in_admit)
         still_running: list[Sequence] = []
@@ -472,11 +522,14 @@ class ContinuousBatchingEngine:
     # -- convenience --------------------------------------------------------
 
     def run(self, requests: list[Request]) -> list[Request]:
+        """Drain a list of requests. Rejections are returned alongside them."""
+        out: list[Request] = []
         for r in requests:
             self.add_request(r)
-        out: list[Request] = []
+            out.extend(self.drain_rejected())
         while self.has_work():
             out.extend(self.step())
+            out.extend(self.drain_rejected())
         return out
 
 

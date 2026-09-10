@@ -75,6 +75,10 @@ def main() -> int:
                     help="per-slot reservation for the contiguous pool")
     ap.add_argument("--max-batch-size", type=int, default=64,
                     help="cap on concurrent sequences for --engine continuous")
+    ap.add_argument("--admission", action="store_true",
+                    help="enable admission control (bounded queue + deadline projection)")
+    ap.add_argument("--max-queue-depth", type=int, default=64)
+    ap.add_argument("--admission-slack", type=float, default=1.25)
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="disable prefix-block reuse for --engine continuous")
     ap.add_argument("--reserve-blocks", type=int, default=8,
@@ -147,12 +151,16 @@ def main() -> int:
         if args.repeats > 1:
             print(f"\n--- repeat {rep + 1}/{args.repeats} ---", flush=True)
         if args.engine == "continuous":
+            from engine.admission import AdmissionConfig
             from engine.scheduler import ContinuousBatchingEngine
 
             engine = ContinuousBatchingEngine(
                 model, make_kv_pool(), eos_token_id=tok.eos_id, device=args.device,
                 max_batch_size=args.max_batch_size, reserve_blocks=args.reserve_blocks,
                 enable_prefix_cache=not args.no_prefix_cache,
+                admission=AdmissionConfig(
+                    max_queue_depth=args.max_queue_depth, slack=args.admission_slack
+                ) if args.admission else None,
             )
         else:
             engine = BaselineEngine(

@@ -109,6 +109,13 @@ def run(
         while pending and pending[0].arrival_time <= now:
             engine.add_request(pending.popleft())
 
+        # Requests turned away by admission control are outcomes too. They
+        # belong in the results -- as the rejection rate, never as goodput --
+        # and dropping them would make an engine that rejects everything look
+        # like one that served a small workload perfectly.
+        if hasattr(engine, "drain_rejected"):
+            completed.extend(engine.drain_rejected())
+
         if engine.has_work():
             completed.extend(engine.step())
         elif pending:
