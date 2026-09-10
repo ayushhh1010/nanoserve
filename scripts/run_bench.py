@@ -39,6 +39,7 @@ ENGINES = {
     "baseline-nocache": dict(use_cache=False),  # no cache: re-attend every token
     "baseline-static": dict(use_cache=True),    # preallocated contiguous slot
     "baseline-paged": dict(use_cache=True),     # block table + free list
+    "continuous": {},                           # iteration-level scheduling
 }
 
 
@@ -68,6 +69,10 @@ def main() -> int:
                     help="KV pool budget for --engine baseline-static")
     ap.add_argument("--max-seq-len", type=int, default=1024,
                     help="per-slot reservation for the contiguous pool")
+    ap.add_argument("--max-batch-size", type=int, default=64,
+                    help="cap on concurrent sequences for --engine continuous")
+    ap.add_argument("--reserve-blocks", type=int, default=8,
+                    help="floor on KV headroom kept for growing sequences")
     ap.add_argument("--block-size", type=int, default=16,
                     help="tokens per block for --engine baseline-paged")
     ap.add_argument("--repeats", type=int, default=1,
@@ -112,7 +117,7 @@ def main() -> int:
     def make_kv_pool():
         budget = args.kv_budget_mb * 1024 * 1024
         dtype = getattr(torch, args.dtype)
-        if args.engine == "baseline-paged":
+        if args.engine in ("baseline-paged", "continuous"):
             from engine.block_manager import PagedCachePool, blocks_for_budget
 
             kv = PagedCachePool(
@@ -133,11 +138,21 @@ def main() -> int:
     for rep in range(args.repeats):
         if args.repeats > 1:
             print(f"\n--- repeat {rep + 1}/{args.repeats} ---", flush=True)
-        engine = BaselineEngine(
-            model, eos_token_id=tok.eos_id, device=args.device,
-            pool=make_kv_pool() if args.engine in ("baseline-static", "baseline-paged") else None,
-            **ENGINES[args.engine],
-        )
+        if args.engine == "continuous":
+            from engine.scheduler import ContinuousBatchingEngine
+
+            engine = ContinuousBatchingEngine(
+                model, make_kv_pool(), eos_token_id=tok.eos_id, device=args.device,
+                max_batch_size=args.max_batch_size, reserve_blocks=args.reserve_blocks,
+            )
+        else:
+            engine = BaselineEngine(
+                model, eos_token_id=tok.eos_id, device=args.device,
+                pool=make_kv_pool()
+                if args.engine in ("baseline-static", "baseline-paged")
+                else None,
+                **ENGINES[args.engine],
+            )
         engine.name = args.engine
         # Rebuild the workload each repeat: Request objects carry mutable
         # timing state, so reusing them would measure the second run against
