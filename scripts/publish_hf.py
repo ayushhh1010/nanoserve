@@ -12,7 +12,9 @@ which is the whole reason publishing is not a flag on the exporter.
 
 Authentication is yours to do, once, before running this:
 
-    huggingface-cli login
+    hf auth login
+
+(`huggingface-cli` was removed in huggingface_hub 1.0; `hf` replaces it.)
 
 That stores a token in your own keychain. This script never asks for, reads, or
 handles a token; it only uses a login you already performed. Never paste a
@@ -92,7 +94,7 @@ def main() -> int:
     try:
         who = api.whoami()
     except Exception:  # noqa: BLE001 - any auth failure means the same thing
-        print("not logged in. Run:  huggingface-cli login\n"
+        print("not logged in. Run:  hf auth login\n"
               "Create a token with *write* access at "
               "https://huggingface.co/settings/tokens", file=sys.stderr)
         return 1

@@ -196,8 +196,8 @@ def main() -> int:
     for p in sorted(args.out.iterdir()):
         print(f"  {p.stat().st_size / 1024**2:8.2f} MB  {p.name}")
     print("\nNothing has been uploaded. To publish, from that directory:")
-    print("  huggingface-cli login")
-    print(f"  huggingface-cli upload <your-username>/nanoserve-27m {args.out} .")
+    print("  hf auth login")
+    print(f"  hf upload <your-username>/nanoserve-27m {args.out} .")
     return 0
 
 
