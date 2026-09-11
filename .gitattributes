@@ -1,0 +1,18 @@
+# Normalise to LF in the repository. The headline Phase 2 benchmarks are run
+# on Linux while development happens on Windows, so without this every file
+# round-trips through CRLF and every cross-platform diff is 100% changed
+# lines. Checkout stays native, so Windows tooling still sees CRLF locally.
+* text=auto eol=lf
+
+# Binary: never touch these.
+*.pt      binary
+*.bin     binary
+*.png     binary
+*.gif     binary
+*.pdf     binary
+*.safetensors binary
+
+# Generated protobuf stubs: keep them out of diffs and language stats.
+engine/pb/*_pb2.py      linguist-generated=true
+engine/pb/*_pb2_grpc.py linguist-generated=true
+router/*.pb.go          linguist-generated=true

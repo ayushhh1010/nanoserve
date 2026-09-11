@@ -69,6 +69,12 @@ type HealthChecker struct {
 
 	mu     sync.Mutex
 	misses map[string]int
+	// last successful health response per replica. The checker already pays
+	// for these RPCs to decide readiness; the load fields ride along for free
+	// and are what the autoscaler steers on. Polling them a second time from
+	// a separate component would double the health traffic and give the two
+	// consumers disagreeing views of the same instant.
+	loads map[string]*HealthResponse
 	// failuresToUnready is how many consecutive failed checks mark a replica
 	// unready. One is too eager: a single dropped health check during a long
 	// forward pass would pull a healthy replica out of rotation and move every
@@ -86,6 +92,7 @@ func NewHealthChecker(
 		timeout:           timeout,
 		log:               log,
 		misses:            make(map[string]int),
+		loads:             make(map[string]*HealthResponse),
 		failuresToUnready: 2,
 	}
 }
@@ -133,6 +140,7 @@ func (h *HealthChecker) checkOne(ctx context.Context, id string) {
 
 	if err != nil || !resp.GetReady() {
 		h.misses[id]++
+		delete(h.loads, id)
 		if h.misses[id] >= h.failuresToUnready {
 			h.ring.SetReady(id, false)
 			if h.misses[id] == h.failuresToUnready {
@@ -150,7 +158,39 @@ func (h *HealthChecker) checkOne(ctx context.Context, id string) {
 		h.log.Info("replica recovered", "replica", id)
 	}
 	h.misses[id] = 0
+	h.loads[id] = resp
 	h.ring.SetReady(id, true)
+}
+
+// Load returns the fleet's current aggregate, as the autoscaler sees it.
+//
+// Only replicas that are ready *and* answered their last check are counted. A
+// replica that has stopped answering contributes no queue depth, which is
+// correct: its requests are already being retried onto replicas that do count
+// them, and counting a dead replica as capacity would suppress the scale-up
+// that its death is precisely the reason for.
+func (h *HealthChecker) Load() ClusterLoad {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var out ClusterLoad
+	for _, rep := range h.ring.Snapshot() {
+		out.Registered++
+		if !rep.Ready {
+			continue
+		}
+		resp, ok := h.loads[rep.ID]
+		if !ok || h.misses[rep.ID] > 0 {
+			continue
+		}
+		out.ReadyReplicas++
+		out.TotalWaiting += int(resp.GetNumWaiting())
+		out.TotalRunning += int(resp.GetNumRunning())
+		if kv := float64(resp.GetKvUtilization()); kv > out.MaxKVUtilization {
+			out.MaxKVUtilization = kv
+		}
+	}
+	return out
 }
 
 // Reconciler applies registry membership changes to the ring.

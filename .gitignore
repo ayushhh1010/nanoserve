@@ -27,3 +27,4 @@ router/router.exe
 router/router
 controller/controller.exe
 controller/controller
+router/*.exe
