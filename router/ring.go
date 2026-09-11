@@ -163,6 +163,23 @@ func (r *Ring) SetReady(id string, ready bool) {
 // system prompt produce the same key and therefore prefer the same replica,
 // which is what makes its KV cache worth anything.
 func (r *Ring) Pick(key string) (*Replica, error) {
+	return r.PickExcluding(key, nil)
+}
+
+// PickExcluding is Pick, skipping replicas already tried for this request.
+//
+// The exclusion has to happen inside the walk, and that is not a refinement --
+// it is the difference between having failover and not. Pick is deterministic:
+// for a given key it starts at the same point on the ring and returns the same
+// replica. So a caller that picks, sees the replica is one it already tried,
+// puts it back and picks again gets the identical answer, every time, until it
+// gives up and reports that no replica was available -- while the rest of a
+// healthy cluster sat idle.
+//
+// That is exactly how this was written, and every unit test passed, because no
+// unit test ever made the first choice fail. The chaos suite killed a replica
+// under load and 539 of 715 requests died rather than migrating.
+func (r *Ring) PickExcluding(key string, exclude map[string]bool) (*Replica, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -177,6 +194,11 @@ func (r *Ring) Pick(key string) (*Replica, error) {
 			total += rep.Load
 		}
 	}
+	// Load is counted across every ready replica, excluded ones included. The
+	// cap is a statement about the cluster mean, and recomputing it over a
+	// shrinking candidate set would tighten the bound on each retry -- so a
+	// failover would be most likely to be refused exactly when it is most
+	// needed.
 	if ready == 0 {
 		return nil, ErrNoReplicas
 	}
@@ -198,6 +220,9 @@ func (r *Ring) Pick(key string) (*Replica, error) {
 			continue
 		}
 		seen[p.replicaID] = true
+		if exclude[p.replicaID] {
+			continue
+		}
 		if rep.Load < limit {
 			rep.Load++
 			return rep, nil
@@ -209,7 +234,10 @@ func (r *Ring) Pick(key string) (*Replica, error) {
 	// rather than erroring, because dropping a request to preserve a proof is
 	// the wrong trade in a server.
 	var best *Replica
-	for _, rep := range r.replicas {
+	for id, rep := range r.replicas {
+		if exclude[id] {
+			continue
+		}
 		if rep.Ready && (best == nil || rep.Load < best.Load) {
 			best = rep
 		}

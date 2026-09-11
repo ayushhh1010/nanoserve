@@ -194,21 +194,59 @@ func (h *HealthChecker) Load() ClusterLoad {
 }
 
 // Reconciler applies registry membership changes to the ring.
+//
+// The registry says which replicas *should* be in the pool; health says which
+// ones *can* serve. They disagree more often than the happy path suggests, and
+// the direction of the disagreement decides who to believe: adding capacity on
+// the registry's word alone routes traffic to a process still loading its
+// model, while removing capacity on the registry's word alone throws away
+// backends that are answering every request put to them.
+//
+// So a replica the registry has dropped is retained while it still passes
+// health checks, and reaped once it does not. This is the same reasoning as
+// Envoy's panic mode: when discovery claims nearly everything is gone, the
+// likelier explanation is that discovery is broken, not that the fleet
+// evaporated.
+//
+// Measured, not theorised. Stopping etcd made it broadcast lease-expiry
+// deletes for every replica on its way down -- the leases really had lapsed,
+// because the replicas could not renew against an etcd that was shutting
+// down. The router dutifully emptied its ring and returned "no replicas
+// available" for every request, while two perfectly healthy replicas sat
+// there answering health checks. A control plane outage had become a total
+// outage, which is the exact inversion of what a control plane is for.
 type Reconciler struct {
 	ring *Ring
 	log  *slog.Logger
+
+	mu sync.Mutex
+	// orphans are replicas the registry dropped but health still vouches for.
+	orphaned map[string]bool
 }
 
 func NewReconciler(ring *Ring, log *slog.Logger) *Reconciler {
-	return &Reconciler{ring: ring, log: log}
+	return &Reconciler{ring: ring, log: log, orphaned: make(map[string]bool)}
 }
+
+// ReapInterval is how often retained-but-deregistered replicas are re-checked.
+const ReapInterval = 2 * time.Second
 
 // Run consumes membership events until the channel closes or ctx is cancelled.
 func (rc *Reconciler) Run(ctx context.Context, events <-chan []Endpoint) {
+	// Reaping is on a timer rather than only on membership events, because a
+	// replica that is genuinely dead produces exactly one event -- its lease
+	// expiring -- and at that instant health has not failed yet. Without a
+	// timer the ring would hold that corpse until the next unrelated
+	// registration happened to arrive.
+	ticker := time.NewTicker(ReapInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-ticker.C:
+			rc.reap()
 		case eps, ok := <-events:
 			if !ok {
 				return
@@ -224,13 +262,59 @@ func (rc *Reconciler) apply(endpoints []Endpoint) {
 		wanted[e.ID] = e.Addr
 	}
 
+	rc.mu.Lock()
 	for _, rep := range rc.ring.Snapshot() {
-		if _, keep := wanted[rep.ID]; !keep {
-			rc.log.Info("replica deregistered", "replica", rep.ID)
-			rc.ring.Remove(rep.ID)
+		if _, keep := wanted[rep.ID]; keep {
+			delete(rc.orphaned, rep.ID)
+			continue
 		}
+		if rep.Ready {
+			if !rc.orphaned[rep.ID] {
+				rc.log.Warn("replica deregistered but still healthy; retaining",
+					"replica", rep.ID,
+					"reason", "discovery may be wrong; the replica is answering")
+			}
+			rc.orphaned[rep.ID] = true
+			continue
+		}
+		rc.log.Info("replica deregistered", "replica", rep.ID)
+		delete(rc.orphaned, rep.ID)
+		rc.ring.Remove(rep.ID)
 	}
+	rc.mu.Unlock()
+
 	for id, addr := range wanted {
 		rc.ring.Add(id, addr)
 	}
+}
+
+// reap drops retained replicas once health stops vouching for them.
+func (rc *Reconciler) reap() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if len(rc.orphaned) == 0 {
+		return
+	}
+	for _, rep := range rc.ring.Snapshot() {
+		if rc.orphaned[rep.ID] && !rep.Ready {
+			rc.log.Info("retained replica failed health; removing",
+				"replica", rep.ID)
+			delete(rc.orphaned, rep.ID)
+			rc.ring.Remove(rep.ID)
+		}
+	}
+}
+
+// Orphaned reports replicas being retained against the registry's wishes.
+// Surfaced so this shows up in /stats rather than only in logs: running on
+// retained membership is a degraded state, and a degraded state nobody can
+// see is one nobody fixes.
+func (rc *Reconciler) Orphaned() []string {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	out := make([]string, 0, len(rc.orphaned))
+	for id := range rc.orphaned {
+		out = append(out, id)
+	}
+	return out
 }

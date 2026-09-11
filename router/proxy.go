@@ -35,6 +35,9 @@ type Proxy struct {
 	log        *slog.Logger
 	prefixLen  int
 	maxRetries int
+	// reconciler is optional, used only to surface degraded membership in
+	// /stats. The proxy never asks it to make a routing decision.
+	reconciler *Reconciler
 	// limiter is optional. Nil means no rate limiting, which is a legitimate
 	// single-tenant deployment rather than a missing feature.
 	limiter *RateLimiter
@@ -49,6 +52,13 @@ type Proxy struct {
 	rejected   atomic.Int64
 	throttled  atomic.Int64
 	degraded   atomic.Int64
+}
+
+// WithReconciler lets /stats report replicas being retained against the
+// registry's wishes -- a degraded state that is otherwise only in the logs.
+func (p *Proxy) WithReconciler(rc *Reconciler) *Proxy {
+	p.reconciler = rc
+	return p
 }
 
 // WithRateLimiter enables per-client limits. Optional at construction so the
@@ -309,19 +319,10 @@ func (p *Proxy) attempt(
 // "retry" achieves nothing, so exhausted replicas are held out and released
 // only when the request ends.
 func (p *Proxy) pickUntried(key string, tried map[string]bool) (*Replica, error) {
-	for i := 0; i < p.ring.Len()+1; i++ {
-		rep, err := p.ring.Pick(key)
-		if err != nil {
-			return nil, err
-		}
-		if !tried[rep.ID] {
-			return rep, nil
-		}
-		// Return the reservation before looking again, or the load accounting
-		// drifts upward on every retry.
-		p.ring.Release(rep.ID)
-	}
-	return nil, ErrNoReplicas
+	// One call, with the exclusion applied inside the ring walk. The previous
+	// version picked and released in a loop hoping for a different answer,
+	// which a deterministic hash never gives.
+	return p.ring.PickExcluding(key, tried)
 }
 
 func isRejection(err error) bool {
@@ -363,7 +364,15 @@ func (p *Proxy) Stats() map[string]any {
 		"replicas":   perReplica,
 		"ready":      p.ring.ReadyCount(),
 		"load_cap":   p.ring.LoadCap(),
+		"orphaned":   orphanedOf(p.reconciler),
 	}
+}
+
+func orphanedOf(rc *Reconciler) []string {
+	if rc == nil {
+		return nil
+	}
+	return rc.Orphaned()
 }
 
 // clientKey identifies the tenant a request is billed to.

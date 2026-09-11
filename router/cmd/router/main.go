@@ -103,7 +103,8 @@ func main() {
 	checker := router.NewHealthChecker(ring, pool, *healthEvery, *healthWait, log)
 	go checker.Run(ctx)
 
-	proxy := router.NewProxy(ring, pool, *prefixLen, *maxRetries, log)
+	proxy := router.NewProxy(ring, pool, *prefixLen, *maxRetries, log).
+		WithReconciler(reconciler)
 
 	if *redisAddr != "" {
 		cfg := router.DefaultRateLimitConfig()

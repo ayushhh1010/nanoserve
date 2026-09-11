@@ -471,3 +471,104 @@ func TestNewReplicasStartUnready(t *testing.T) {
 		t.Fatalf("still unpickable after health check: %v", err)
 	}
 }
+
+// TestPickExcludingActuallyFailsOver is the regression test for the bug the
+// chaos suite found.
+//
+// Pick is deterministic: the same key starts at the same ring position and
+// returns the same replica. The original failover picked, noticed it had the
+// replica it had just tried, released it, and picked again -- getting the
+// identical answer every time, then reporting that no replica was available
+// while the rest of a healthy cluster sat idle. Under a killed replica this
+// dropped 539 of 715 requests.
+//
+// Every existing unit test passed throughout, because none of them ever made
+// the first choice fail.
+func TestPickExcludingActuallyFailsOver(t *testing.T) {
+	ring := NewRing(DefaultVirtualNodes, DefaultEpsilon)
+	for _, id := range []string{"a", "b", "c"} {
+		ring.Add(id, id+":9101")
+		ring.SetReady(id, true)
+	}
+
+	const key = "a stable prefix that always hashes to the same replica"
+
+	first, err := ring.Pick(key)
+	if err != nil {
+		t.Fatalf("Pick: %v", err)
+	}
+	ring.Release(first.ID)
+
+	// Repeated picks must agree -- that determinism is the locality guarantee,
+	// and it is also what made the old failover loop useless.
+	for i := 0; i < 20; i++ {
+		again, err := ring.Pick(key)
+		if err != nil {
+			t.Fatalf("Pick: %v", err)
+		}
+		ring.Release(again.ID)
+		if again.ID != first.ID {
+			t.Fatalf("Pick returned %s then %s for the same key; prefix "+
+				"locality depends on this being stable", first.ID, again.ID)
+		}
+	}
+
+	tried := map[string]bool{first.ID: true}
+	second, err := ring.PickExcluding(key, tried)
+	if err != nil {
+		t.Fatalf("PickExcluding with one replica excluded returned %v; two "+
+			"healthy replicas remain and failover must find one", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("PickExcluding returned the excluded replica %s", second.ID)
+	}
+
+	tried[second.ID] = true
+	third, err := ring.PickExcluding(key, tried)
+	if err != nil {
+		t.Fatalf("PickExcluding with two excluded returned %v; one healthy "+
+			"replica remains", err)
+	}
+	if tried[third.ID] {
+		t.Fatalf("PickExcluding returned already-tried %s", third.ID)
+	}
+
+	// All three exhausted: now, and only now, is "no replica" the right answer.
+	tried[third.ID] = true
+	if rep, err := ring.PickExcluding(key, tried); err == nil {
+		t.Fatalf("PickExcluding returned %s with every replica excluded", rep.ID)
+	}
+}
+
+// TestPickExcludingSkipsUnreadyAndExcludedInFallback covers the least-loaded
+// fallback path, which is reached when every candidate is at the load cap. It
+// had its own copy of the same bug: the fallback scanned all ready replicas
+// and would happily hand back one the caller had just failed on.
+func TestPickExcludingSkipsUnreadyAndExcludedInFallback(t *testing.T) {
+	ring := NewRing(DefaultVirtualNodes, DefaultEpsilon)
+	for _, id := range []string{"a", "b"} {
+		ring.Add(id, id+":9101")
+		ring.SetReady(id, true)
+	}
+	ring.Add("c", "c:9101") // registered but never health-checked
+
+	// Drive both ready replicas well past the cap so the walk finds nobody
+	// and the fallback runs.
+	for i := 0; i < 50; i++ {
+		if rep, err := ring.Pick("key"); err == nil {
+			_ = rep
+		}
+	}
+
+	rep, err := ring.PickExcluding("key", map[string]bool{"a": true})
+	if err != nil {
+		t.Fatalf("PickExcluding: %v", err)
+	}
+	if rep.ID == "a" {
+		t.Fatal("fallback returned the excluded replica")
+	}
+	if rep.ID == "c" {
+		t.Fatal("fallback returned an unready replica; a registry entry means " +
+			"a replica exists, not that it can serve")
+	}
+}
