@@ -32,11 +32,13 @@ from typing import AsyncIterator
 
 import torch
 from fastapi import FastAPI, HTTPException, Request as HTTPRequest
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from engine.admission import AdmissionConfig
 from engine.block_manager import PagedCachePool, blocks_for_budget
+from engine.metrics import EngineMetrics
 from engine.scheduler import ContinuousBatchingEngine
 from engine.types import FinishReason, Request, SamplingParams
 from model.generate import load_model
@@ -67,9 +69,16 @@ class Stream:
 class AsyncEngine:
     """Drives the scheduler on a background task and fans tokens out to streams."""
 
-    def __init__(self, engine: ContinuousBatchingEngine, idle_sleep: float = 0.001) -> None:
+    def __init__(
+        self,
+        engine: ContinuousBatchingEngine,
+        idle_sleep: float = 0.001,
+        metrics: EngineMetrics | None = None,
+    ) -> None:
         self.engine = engine
         self.idle_sleep = idle_sleep
+        self.metrics = metrics
+        self._recorded: set[str] = set()
         self.streams: dict[str, Stream] = {}
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -131,11 +140,21 @@ class AsyncEngine:
             self._fanout()
 
     def _fanout(self) -> None:
-        """Move engine output into per-request queues.
+        """Move engine output into per-request queues, and record metrics.
 
         Drained through the engine's explicit accessors rather than by
         inspecting request state, which would race with the next step.
         """
+        if self.metrics is not None:
+            self.metrics.observe_engine(self.engine)
+            # Requests are recorded once, on the transition to finished. The
+            # engine keeps its `finished` list for the life of the process, so
+            # re-observing it every fanout would multiply every counter by the
+            # number of steps.
+            for req in self.engine.finished:
+                if req.request_id not in self._recorded and req.finish_reason is not None:
+                    self._recorded.add(req.request_id)
+                    self.metrics.observe_finished(req)
         for req, token_id in self.engine.drain_emitted():
             stream = self.streams.get(req.request_id)
             if stream is not None:
@@ -185,7 +204,8 @@ def build_app(
         )
         state["tok"] = tok
         state["meta"] = meta
-        state["async_engine"] = AsyncEngine(engine)
+        state["metrics"] = EngineMetrics()
+        state["async_engine"] = AsyncEngine(engine, metrics=state["metrics"])
         await state["async_engine"].start()
         try:
             yield
@@ -209,8 +229,20 @@ def build_app(
             "preemptions": eng.preemptions,
         }
 
-    @app.get("/metrics")
-    async def metrics() -> dict:
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> Response:
+        """Prometheus exposition format.
+
+        Naming follows vLLM's convention so an existing dashboard reads this
+        server without a translation table.
+        """
+        state["metrics"].observe_engine(state["async_engine"].engine)
+        body, content_type = state["metrics"].render()
+        return Response(content=body, media_type=content_type)
+
+    @app.get("/stats")
+    async def stats() -> dict:
+        """The same numbers as JSON, for humans and for the benchmark harness."""
         eng = state["async_engine"].engine
         s = eng.stats()
         out = {
