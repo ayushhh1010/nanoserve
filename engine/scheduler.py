@@ -237,6 +237,9 @@ class ContinuousBatchingEngine:
         self.running: list[Sequence] = []
         self.finished: list[Request] = []
         self._rejected: list[Request] = []
+        self._cancelled: list[Request] = []
+        self._cancel_requested: set[str] = set()
+        self._emitted: list[tuple[Request, int]] = []
         #: How often memory pressure forced an eviction. A healthy server runs
         #: at zero; a non-zero count means the pool is undersized for the load.
         self.preemptions = 0
@@ -267,6 +270,71 @@ class ContinuousBatchingEngine:
                 self._rejected.append(request)
                 return
         self.waiting.append(request)
+
+    def request_cancel(self, request_id: str) -> None:
+        """Ask for a request to be cancelled at the next safe point.
+
+        Deliberately does NOT touch `running` or `waiting`. The scheduler step
+        may be executing on another thread -- the server drives it through
+        `asyncio.to_thread` so the event loop stays free to notice disconnects
+        -- and mutating the batch underneath a step in flight corrupts it. A
+        cancellation is therefore recorded and applied by the owning thread.
+        """
+        self._cancel_requested.add(request_id)
+
+    def apply_cancellations(self) -> list[Request]:
+        """Apply pending cancellations. Called by whoever owns the step.
+
+        Runs at the top of `step`, and from the idle path when nothing is
+        running -- otherwise a cancellation arriving on an idle engine would
+        wait for the next request before taking effect.
+        """
+        if not self._cancel_requested:
+            return []
+
+        wanted, self._cancel_requested = self._cancel_requested, set()
+        done: list[Request] = []
+
+        for seq in [s for s in self.running if s.request.request_id in wanted]:
+            # Freeing here is the whole point. A cancelled generation that
+            # keeps its blocks is the classic serving leak: the pool drains one
+            # abandoned request at a time, throughput decays, and nothing ever
+            # raises. It is invisible to every test that only exercises
+            # requests which finish.
+            seq.cache.free()
+            seq.request.finish(FinishReason.CANCELLED)
+            self.finished.append(seq.request)
+            done.append(seq.request)
+            self.running.remove(seq)
+
+        for req in [r for r in self.waiting if r.request_id in wanted]:
+            # A client can hang up before its request ever starts.
+            self.waiting.remove(req)
+            req.finish(FinishReason.CANCELLED)
+            self.finished.append(req)
+            done.append(req)
+
+        self._cancelled.extend(done)
+        return done
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel synchronously. Safe only when no step is in flight.
+
+        Used by tests and single-threaded callers. The server uses
+        `request_cancel` plus `apply_cancellations` instead.
+        """
+        self.request_cancel(request_id)
+        return bool(self.apply_cancellations())
+
+    def drain_cancelled(self) -> list[Request]:
+        """Requests cancelled since the last call."""
+        out, self._cancelled = self._cancelled, []
+        return out
+
+    def drain_emitted(self) -> list[tuple[Request, int]]:
+        """(request, token) pairs produced since the last call."""
+        out, self._emitted = self._emitted, []
+        return out
 
     def drain_rejected(self) -> list[Request]:
         """Requests turned away since the last call.
@@ -358,7 +426,10 @@ class ContinuousBatchingEngine:
                 continue
 
             seq = Sequence(request=req, cache=cache, next_token=int(token.item()))
+            before = req.output_len
             self._accept_token(seq, seq.next_token)
+            if req.output_len > before:
+                self._emitted.append((req, seq.next_token))
             if not seq.finished:
                 admitted.append(seq)
             else:
@@ -440,7 +511,10 @@ class ContinuousBatchingEngine:
     @torch.inference_mode()
     def step(self) -> list[Request]:
         """One scheduling iteration: reap, admit, then a single decode pass."""
+        cancelled = self.apply_cancellations()
+
         new_seqs, done_in_admit = self._admit()
+        done_in_admit = cancelled + done_in_admit
         self.running.extend(new_seqs)
         if not self.running:
             return done_in_admit
@@ -492,7 +566,13 @@ class ContinuousBatchingEngine:
         still_running: list[Sequence] = []
         for seq, token_id in zip(batch, next_ids):
             seq.next_token = token_id
+            before = seq.request.output_len
             self._accept_token(seq, token_id)
+            if seq.request.output_len > before:
+                # Recorded per step so a streaming transport can forward tokens
+                # as they are produced rather than polling request state, which
+                # would race with the next step overwriting it.
+                self._emitted.append((seq.request, token_id))
             if seq.finished:
                 done.append(self._retire(seq))
             else:

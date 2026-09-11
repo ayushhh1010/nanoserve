@@ -15,6 +15,10 @@ packages = ["model", "engine", "bench"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# asyncio tests are marked with pytestmark at module level; "auto" lets them
+# run without decorating every function.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
