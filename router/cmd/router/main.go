@@ -31,6 +31,14 @@ func main() {
 		maxRetries  = flag.Int("max-retries", 2, "replica failovers per request")
 		healthEvery = flag.Duration("health-interval", 2*time.Second, "health poll interval")
 		healthWait  = flag.Duration("health-timeout", 1*time.Second, "health poll timeout")
+
+		redisAddr = flag.String("redis", "", "Redis for distributed rate limiting; empty disables it")
+		rpm       = flag.Float64("rpm", 60, "requests per minute per client")
+		tpm       = flag.Float64("tpm", 60000, "generated tokens per minute per client")
+		reqBurst  = flag.Float64("request-burst", 10, "request bucket capacity")
+		tokBurst  = flag.Float64("token-burst", 10000, "token bucket capacity")
+		failOpen  = flag.Bool("ratelimit-fail-open", true,
+			"admit requests when Redis is unreachable rather than reject them")
 	)
 	flag.Parse()
 
@@ -96,6 +104,22 @@ func main() {
 	go checker.Run(ctx)
 
 	proxy := router.NewProxy(ring, pool, *prefixLen, *maxRetries, log)
+
+	if *redisAddr != "" {
+		cfg := router.DefaultRateLimitConfig()
+		cfg.RequestsPerMinute, cfg.TokensPerMinute = *rpm, *tpm
+		cfg.RequestBurst, cfg.TokenBurst = *reqBurst, *tokBurst
+		cfg.FailOpen = *failOpen
+		limiter, err := router.NewRateLimiter(*redisAddr, cfg)
+		if err != nil {
+			log.Error("invalid rate limit config", "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = limiter.Close() }()
+		proxy = proxy.WithRateLimiter(limiter)
+		log.Info("rate limiting enabled", "redis", *redisAddr,
+			"rpm", *rpm, "tpm", *tpm, "fail_open", *failOpen)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /generate", proxy.ServeGenerate)

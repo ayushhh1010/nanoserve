@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +35,9 @@ type Proxy struct {
 	log        *slog.Logger
 	prefixLen  int
 	maxRetries int
+	// limiter is optional. Nil means no rate limiting, which is a legitimate
+	// single-tenant deployment rather than a missing feature.
+	limiter *RateLimiter
 
 	// Counters for /metrics. Atomic rather than mutex-guarded: they are
 	// touched on every request and never read in the same critical section as
@@ -41,6 +47,15 @@ type Proxy struct {
 	migrations atomic.Int64
 	failures   atomic.Int64
 	rejected   atomic.Int64
+	throttled  atomic.Int64
+	degraded   atomic.Int64
+}
+
+// WithRateLimiter enables per-client limits. Optional at construction so the
+// router runs unchanged without Redis.
+func (p *Proxy) WithRateLimiter(rl *RateLimiter) *Proxy {
+	p.limiter = rl
+	return p
 }
 
 func NewProxy(ring *Ring, pool *ClientPool, prefixLen, maxRetries int, log *slog.Logger) *Proxy {
@@ -89,8 +104,63 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Request-Id", body.RequestID)
 
+	// Limit before dispatching, not after. The point of a limit is to refuse
+	// work before it costs anything; checking once a replica is already
+	// prefilling would bill the GPU for every rejected request.
+	//
+	// Reserve MaxTokens, refund the remainder when the stream ends. The true
+	// cost is unknowable up front, and charging only on completion would let a
+	// client open a thousand concurrent maximum-length generations before any
+	// of them had been billed.
+	client := clientKey(r)
+	if p.limiter != nil {
+		v, err := p.limiter.Allow(r.Context(), client, int(body.MaxTokens))
+		if err != nil {
+			p.throttled.Add(1)
+			http.Error(w, `{"error":"rate limiter unavailable"}`,
+				http.StatusServiceUnavailable)
+			return
+		}
+		if v.Degraded {
+			p.degraded.Add(1)
+		}
+		if !v.Allowed {
+			p.throttled.Add(1)
+			// 429 with Retry-After, except where no amount of waiting helps:
+			// a request larger than the client tier can ever admit is a
+			// permanent 413, and telling it to retry would produce a polite
+			// infinite loop indistinguishable from healthy traffic.
+			if v.Permanent() {
+				http.Error(w, `{"error":"max_tokens exceeds this tier's burst limit"}`,
+					http.StatusRequestEntityTooLarge)
+				return
+			}
+			w.Header().Set("Retry-After",
+				strconv.Itoa(int(math.Ceil(v.RetryAfter.Seconds()))))
+			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	p.requests.Add(1)
-	if err := p.stream(r.Context(), w, flusher, body); err != nil {
+	delivered := 0
+	if p.limiter != nil {
+		defer func() {
+			// Refund on every exit path, including client disconnects and
+			// errors: an abandoned stream that keeps its full reservation
+			// charges the client for tokens nobody ever generated.
+			if unused := int(body.MaxTokens) - delivered; unused > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				if err := p.limiter.Refund(ctx, client, unused); err != nil {
+					p.log.Warn("refund failed; client over-charged until refill",
+						"client", client, "tokens", unused, "err", err)
+				}
+			}
+		}()
+	}
+
+	if err := p.stream(r.Context(), w, flusher, body, &delivered); err != nil {
 		p.failures.Add(1)
 		p.log.Error("request failed", "request_id", body.RequestID, "err", err)
 		writeEvent(w, flusher, "error", map[string]string{"error": err.Error()})
@@ -99,7 +169,8 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 
 // stream dispatches, and retries onto a different replica on failure.
 func (p *Proxy) stream(
-	ctx context.Context, w http.ResponseWriter, flusher http.Flusher, body generateBody,
+	ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
+	body generateBody, deliveredOut *int,
 ) error {
 	key := PrefixKey(body.Prompt, p.prefixLen)
 
@@ -136,6 +207,14 @@ func (p *Proxy) stream(
 
 		n, err := p.attempt(ctx, w, flusher, rep, body, delivered, deadline)
 		p.ring.Release(rep.ID)
+
+		// Report what the client actually received, on every path. This is
+		// what the rate limiter refunds against, so undercounting bills the
+		// client for tokens it never got and overcounting hands back budget
+		// that was really spent.
+		if deliveredOut != nil {
+			*deliveredOut = len(delivered) + len(n)
+		}
 
 		if err == nil {
 			return nil
@@ -279,8 +358,31 @@ func (p *Proxy) Stats() map[string]any {
 		"migrations": p.migrations.Load(),
 		"failures":   p.failures.Load(),
 		"rejected":   p.rejected.Load(),
+		"throttled":  p.throttled.Load(),
+		"degraded":   p.degraded.Load(),
 		"replicas":   perReplica,
 		"ready":      p.ring.ReadyCount(),
 		"load_cap":   p.ring.LoadCap(),
 	}
+}
+
+// clientKey identifies the tenant a request is billed to.
+//
+// An explicit API key when there is one, falling back to the peer address.
+// The fallback is deliberately weak and worth naming: everyone behind one NAT
+// shares a bucket, and a client with a pool of addresses gets a bucket each.
+// It is the only identity available without authentication, so it is the right
+// default and the wrong thing to rely on -- real multi-tenancy needs the key.
+func clientKey(r *http.Request) string {
+	if key := r.Header.Get("X-API-Key"); key != "" {
+		return "key:" + key
+	}
+	if id := r.Header.Get("X-Client-Id"); id != "" {
+		return "client:" + id
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return "ip:" + host
 }
