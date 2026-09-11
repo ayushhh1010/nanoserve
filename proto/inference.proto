@@ -1,0 +1,125 @@
+// The router <-> replica contract.
+//
+// Server-streaming, not unary. A unary RPC would hold the whole generation
+// before returning anything, which throws away the one latency number users
+// actually feel: time to first token. Streaming also lets the router notice a
+// dead replica mid-generation rather than at a timeout.
+//
+// gRPC rather than HTTP chunking because the router holds thousands of
+// concurrent streams: HTTP/2 multiplexes them over one connection per replica
+// instead of one socket each, and protobuf framing removes the need to parse
+// SSE text on a hot path.
+
+syntax = "proto3";
+
+package nanoserve.v1;
+
+option go_package = "github.com/nanoserve/router/proto;proto";
+
+service Inference {
+  // One request, a stream of tokens.
+  rpc Generate(GenerateRequest) returns (stream GenerateChunk);
+
+  // Liveness plus the load signal the router routes on. Deliberately cheap:
+  // the router polls this often, and a health check that takes a lock or
+  // touches the GPU becomes the thing that makes a replica look unhealthy.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Ask a replica to stop accepting work and finish what it has. Used by the
+  // graceful-drain path so a deploy does not kill in-flight generations.
+  rpc Drain(DrainRequest) returns (DrainResponse);
+}
+
+message SamplingParams {
+  uint32 max_tokens = 1;
+  float temperature = 2;
+  uint32 top_k = 3;      // 0 means unset
+  float top_p = 4;       // 0 means unset
+  bool ignore_eos = 5;
+}
+
+message GenerateRequest {
+  string prompt = 1;
+  SamplingParams params = 2;
+
+  // Idempotency key. A retry after a replica dies carries the SAME id, so a
+  // replica that already has it returns the existing stream rather than
+  // starting a second generation. Without this, every retry doubles the work
+  // the cluster does at exactly the moment it is least able to afford it.
+  string request_id = 3;
+
+  // Absolute deadline, Unix epoch seconds. Absolute rather than a duration so
+  // it survives queueing at the router: a "5 second" budget restarted at each
+  // hop is not a budget.
+  double deadline_unix = 4;
+
+  // Tokens the client has already received from a previous, failed attempt.
+  // On migration the router replays prompt + these, so the new replica
+  // continues rather than restarting, and the client never sees a token twice.
+  repeated uint32 resume_tokens = 5;
+}
+
+message GenerateChunk {
+  oneof payload {
+    Token token = 1;
+    Finish finish = 2;
+  }
+}
+
+message Token {
+  // Decoded text for this step. May be empty when a token completes only part
+  // of a multi-byte character -- the replica holds those back rather than
+  // emitting a replacement character mid-word.
+  string text = 1;
+  uint32 token_id = 2;
+  // Position in the output, so a migrating router knows what it already has.
+  uint32 index = 3;
+}
+
+message Finish {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    EOS = 1;
+    LENGTH = 2;
+    CANCELLED = 3;
+    REJECTED = 4;
+    PREEMPTED = 5;
+    ERROR = 6;
+  }
+  Reason reason = 1;
+  uint32 output_tokens = 2;
+  string message = 3;  // set when reason is REJECTED or ERROR
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;          // false while loading, or draining
+  bool draining = 2;
+
+  // The load signal. Bounded-load routing compares in-flight work against the
+  // cluster mean, so the router needs a number that means the same thing on
+  // every replica -- sequences currently generating.
+  uint32 num_running = 3;
+  uint32 num_waiting = 4;
+
+  // 0-1. KV pressure is the real capacity limit for a serving replica, and it
+  // is not visible in CPU or request count.
+  float kv_utilization = 5;
+
+  // Lets the router prefer a replica that already holds a prefix.
+  float prefix_hit_rate = 6;
+
+  string replica_id = 7;
+  uint64 uptime_seconds = 8;
+}
+
+message DrainRequest {
+  // Stop accepting, finish in-flight, then exit. The router removes the
+  // replica from rotation as soon as draining is reported.
+  bool graceful = 1;
+}
+
+message DrainResponse {
+  uint32 in_flight = 1;
+}

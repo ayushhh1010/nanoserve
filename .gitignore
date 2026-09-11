@@ -21,3 +21,9 @@ wandb/
 
 # Export directory is a build artifact, regenerable from a checkpoint.
 export/
+
+# Go
+router/router.exe
+router/router
+controller/controller.exe
+controller/controller
