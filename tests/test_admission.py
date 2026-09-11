@@ -167,7 +167,8 @@ def test_rejection_is_immediate_not_queued(model):
     for i in range(6):
         e.add_request(req(rid=f"r{i}"))
 
-    rejected = e.drain_rejected()
+    rejected = [r for r in e.drain_finished()
+                if r.finish_reason is FinishReason.REJECTED]
     assert len(rejected) == 4
     assert len(e.waiting) == 2
     for r in rejected:
@@ -178,10 +179,11 @@ def test_rejection_is_immediate_not_queued(model):
 
 
 def test_drain_is_not_repeatable(model):
+    """An outcome is consumed exactly once, by whoever transports it."""
     e = engine(model, AdmissionConfig(max_queue_depth=0, enforce_deadlines=False))
     e.add_request(req())
-    assert len(e.drain_rejected()) == 1
-    assert e.drain_rejected() == []
+    assert len(e.drain_finished()) == 1
+    assert e.drain_finished() == []
 
 
 def test_no_admission_config_means_no_gate(model):
@@ -271,7 +273,14 @@ def test_overload_rejects_and_still_completes_the_rest(model):
     open_gate.run(workload(slo))
     open_met = sum(1 for r in open_gate.finished if r.met_deadline)
 
-    gated = engine(model, AdmissionConfig(max_queue_depth=None, slack=1.0))
+    # min_observations=0 so the gate is live from the first request. The whole
+    # workload arrives before any step runs, so a controller with the default
+    # warm-up would still be cold and admit everything -- correct behaviour,
+    # but it would leave this test exercising nothing.
+    gated = engine(
+        model,
+        AdmissionConfig(max_queue_depth=None, slack=1.0, min_observations=0),
+    )
     gated.run(workload(slo))
     gated_met = sum(1 for r in gated.finished if r.met_deadline)
     gated_rejected = sum(1 for r in gated.finished if r.finish_reason is FinishReason.REJECTED)
@@ -310,3 +319,36 @@ def test_rejection_reasons_are_recorded_separately(model):
         )
     assert deadline_only.stats.rejected_deadline == 4
     assert deadline_only.stats.rejected_queue_full == 0
+
+
+def test_deadline_gate_waits_for_measurements():
+    """Projecting from an assumed rate is guessing, and the guess is bad.
+
+    This engine's cold estimate is 50 tok/s against a real ~900. An unguarded
+    gate therefore rejects a burst of perfectly servable traffic at start-up,
+    then measures its rate from the few requests it happened to let through.
+    The deadline gate stays open until enough steps have been observed.
+    """
+    now = time.perf_counter()
+    c = AdmissionController(
+        AdmissionConfig(max_queue_depth=None, slack=1.0, min_observations=10)
+    )
+    impossible = req(max_tokens=100, deadline=now + 0.001)
+
+    assert not c.is_warm
+    assert c.admit(impossible, 1, 10**6, 0, now=now)[0] is True, "rejected while cold"
+
+    for _ in range(10):
+        c.record_step(0.01, batch_size=1)
+    assert c.is_warm
+    assert c.admit(impossible, 1, 10**6, 0, now=now)[0] is False, "should reject once warm"
+
+
+def test_queue_depth_gate_applies_even_when_cold():
+    """Only the projection needs measurements; a full queue is a fact."""
+    c = AdmissionController(
+        AdmissionConfig(max_queue_depth=2, min_observations=100)
+    )
+    assert not c.is_warm
+    assert c.admit(req(), 0, 0, 0)[0] is True
+    assert c.admit(req(), 5, 0, 0) == (False, "queue_full")

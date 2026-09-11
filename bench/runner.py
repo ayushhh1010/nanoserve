@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from bench.metrics import RunResult
+from bench.workload import rebase
 from engine.types import Request, SamplingParams
 
 
@@ -84,12 +85,10 @@ def run(
 
     pending = deque(requests)
     t0 = time.perf_counter()
-    # Arrival times come from the workload as offsets from zero; rebase them
-    # onto the wall clock so latencies are measured against real submission.
-    for r in requests:
-        r.arrival_time += t0
-        if r.deadline is not None:
-            r.deadline += t0
+    # Workload times are offsets from zero. Rebasing is shared with any other
+    # caller rather than inlined here, because an un-rebased deadline makes
+    # admission control reject 100% of traffic.
+    rebase(requests, t0)
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -109,19 +108,30 @@ def run(
         while pending and pending[0].arrival_time <= now:
             engine.add_request(pending.popleft())
 
-        # Requests turned away by admission control are outcomes too. They
-        # belong in the results -- as the rejection rate, never as goodput --
-        # and dropping them would make an engine that rejects everything look
-        # like one that served a small workload perfectly.
-        if hasattr(engine, "drain_rejected"):
-            completed.extend(engine.drain_rejected())
+        drains = hasattr(engine, "drain_finished")
 
         if engine.has_work():
-            completed.extend(engine.step())
-        elif pending:
-            # Nothing to do until the next arrival. Sleep rather than spin, so
-            # the benchmark process does not compete with the engine for CPU.
-            time.sleep(min(cfg.poll_seconds, max(0.0, pending[0].arrival_time - now)))
+            stepped = engine.step()
+            if drains:
+                # Engines with admission control report every outcome through
+                # one drain, rejections included. Those belong in the results
+                # as the rejection rate and never as goodput -- dropping them
+                # would make an engine that refuses everything look like one
+                # that served a small workload perfectly.
+                completed.extend(engine.drain_finished())
+                engine._emitted.clear()  # nothing is streaming these
+            else:
+                completed.extend(stepped)
+        else:
+            if drains:
+                completed.extend(engine.drain_finished())
+            if pending:
+                # Nothing to do until the next arrival. Sleeping rather than
+                # spinning keeps the benchmark process from competing with the
+                # engine for CPU -- and draining is not a substitute for it.
+                time.sleep(
+                    min(cfg.poll_seconds, max(0.0, pending[0].arrival_time - now))
+                )
 
         if cfg.verbose and now - last_report > 5.0:
             last_report = now

@@ -378,3 +378,47 @@ def test_engine_stats_track_the_batch(model):
     assert s.num_waiting == 0
     assert s.kv_blocks_used > 0
     assert 0 < s.kv_utilization <= 1
+
+
+# ---------------------------------------------------------------------------
+# What "identical" means, and where it stops
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for bf16")
+def test_batching_is_exact_in_fp32_and_may_differ_in_bf16():
+    """Batching changes the kernel; allocation does not. Pinned deliberately.
+
+    An allocator change -- static or paged KV -- keeps the same tensor shapes,
+    so it is byte-identical even in bf16. Batching changes attention from
+    (1, H, 1, T) to (B, H, 1, max_len), which selects a different kernel and a
+    different reduction order, so bf16 rounding differs and a near-tied argmax
+    can flip.
+
+    Measured on the trained model, 24 real requests: 0/24 sequences differ in
+    fp32, 5-6/24 in bf16. Asserting bf16 equality would be asserting that two
+    different kernels round identically, which is not a property anything
+    guarantees -- so the contract is fp32 exactness.
+    """
+    torch.manual_seed(0)
+    base = NanoForCausalLM(CFG).eval()
+    specs = spec_workload(6, seed=17)
+
+    for dtype, must_match in ((torch.float32, True), (torch.bfloat16, False)):
+        m = NanoForCausalLM(CFG).eval()
+        m.load_state_dict(base.state_dict())
+        m = m.to("cuda", dtype)
+
+        ref = {r.request_id: r.output_token_ids
+               for r in BaselineEngine(m, eos_token_id=EOS, device="cuda").run(build(specs))}
+        p = PagedCachePool(CFG, num_blocks=512, block_size=16, device="cuda", dtype=dtype)
+        e = ContinuousBatchingEngine(m, p, eos_token_id=EOS, device="cuda",
+                                     max_batch_size=16, reserve_blocks=4)
+        got = {r.request_id: r.output_token_ids for r in e.run(build(specs))}
+
+        if must_match:
+            assert got == ref, "batched decode must be exact in fp32"
+        e.prefix_cache.clear()
+        assert p.allocator.num_allocated == 0, f"leaked in {dtype}"
+        del m, p, e
+        torch.cuda.empty_cache()

@@ -54,6 +54,13 @@ class AdmissionConfig:
     window: int = 50
     #: Assumed step rate before any step has been observed.
     initial_step_seconds: float = 0.02
+    #: Steps that must be observed before the deadline gate is allowed to
+    #: reject anything. Projecting from an assumed rate is guessing, and the
+    #: guess is pessimistic: this engine's cold estimate is 50 tok/s against a
+    #: real ~900, so an unguarded gate rejects a burst of perfectly servable
+    #: traffic at start-up and then measures a rate from the handful it let
+    #: through. The queue-depth gate still applies throughout.
+    min_observations: int = 10
 
 
 @dataclass
@@ -106,6 +113,11 @@ class AdmissionController:
         return sum(self._step_times) / len(self._step_times)
 
     @property
+    def is_warm(self) -> bool:
+        """Has enough been measured to project from?"""
+        return len(self._step_times) >= self.cfg.min_observations
+
+    @property
     def tokens_per_second(self) -> float:
         """Measured aggregate decode rate.
 
@@ -153,7 +165,8 @@ class AdmissionController:
             self.stats.rejected_queue_full += 1
             return False, "queue_full"
 
-        if self.cfg.enforce_deadlines and req.deadline is not None:
+        warm = len(self._step_times) >= self.cfg.min_observations
+        if self.cfg.enforce_deadlines and req.deadline is not None and warm:
             finish = self.project_finish(req, queued_tokens, running_tokens, now)
             # slack > 1 lets a marginal request through: the estimate is noisy,
             # and a wrongly rejected request fails for certain where a wrongly

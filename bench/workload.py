@@ -22,6 +22,7 @@ variance existing.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -77,6 +78,29 @@ def _lognormal_lengths(
     return np.clip(raw, lo, hi).astype(int)
 
 
+def rebase(requests: list[Request], t0: float | None = None) -> list[Request]:
+    """Shift relative arrival times and deadlines onto the wall clock.
+
+    `build_workload` emits times relative to zero so a workload is
+    reproducible and comparable across runs. Nothing else in the system knows
+    that: `AdmissionController` compares deadlines against `perf_counter()`,
+    which on a machine that has been up for a while is a number in the
+    hundreds of thousands. An un-rebased deadline is therefore ~325,000
+    seconds in the past, and admission control rejects 100% of traffic while
+    reporting exactly why.
+
+    Arrival and deadline move together, so the SLO interval is preserved.
+    """
+    t0 = time.perf_counter() if t0 is None else t0
+    for r in requests:
+        # Both shift by the same offset, so the SLO interval
+        # (deadline - arrival) is unchanged.
+        if r.deadline is not None:
+            r.deadline += t0
+        r.arrival_time += t0
+    return requests
+
+
 def build_workload(
     cfg: WorkloadConfig,
     vocab_size: int,
@@ -84,6 +108,9 @@ def build_workload(
     prompt_pool: list[list[int]] | None = None,
 ) -> list[Request]:
     """Materialise a reproducible list of requests with arrival times set.
+
+    Times are RELATIVE to zero. Call `rebase()` before handing them to an
+    engine with admission control -- see that function for why.
 
     `prompt_pool` supplies real tokenised text; without it, token ids are drawn
     uniformly. Random ids are fine for throughput and memory measurements --

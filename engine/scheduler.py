@@ -222,6 +222,8 @@ class ContinuousBatchingEngine:
         #: None disables admission control entirely, which is the naive
         #: unbounded queue the goodput comparison is made against.
         admission: AdmissionConfig | None = None,
+        #: How many finished requests to retain for inspection.
+        history: int = 1024,
     ) -> None:
         self.model = model.eval()
         self.pool = pool
@@ -235,9 +237,15 @@ class ContinuousBatchingEngine:
 
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
-        self.finished: list[Request] = []
-        self._rejected: list[Request] = []
-        self._cancelled: list[Request] = []
+        # Bounded. A long-running server finishes millions of requests and each
+        # Request holds a per-token timestamp list, so retaining them all is an
+        # unbounded leak. `num_finished` carries the true total; this keeps only
+        # a recent window, for inspection and tests.
+        self.finished: deque[Request] = deque(maxlen=history)
+        self.num_finished = 0
+        #: Finished since the last drain, of any reason. Consumed exactly once
+        #: by whoever transports outcomes.
+        self._newly_finished: list[Request] = []
         self._cancel_requested: set[str] = set()
         self._emitted: list[tuple[Request, int]] = []
         #: How often memory pressure forced an eviction. A healthy server runs
@@ -266,8 +274,7 @@ class ContinuousBatchingEngine:
             if not ok:
                 request.finish(FinishReason.REJECTED)
                 request.rejection_reason = reason
-                self.finished.append(request)
-                self._rejected.append(request)
+                self._record_finished(request)
                 return
         self.waiting.append(request)
 
@@ -303,7 +310,7 @@ class ContinuousBatchingEngine:
             # requests which finish.
             seq.cache.free()
             seq.request.finish(FinishReason.CANCELLED)
-            self.finished.append(seq.request)
+            self._record_finished(seq.request)
             done.append(seq.request)
             self.running.remove(seq)
 
@@ -311,10 +318,9 @@ class ContinuousBatchingEngine:
             # A client can hang up before its request ever starts.
             self.waiting.remove(req)
             req.finish(FinishReason.CANCELLED)
-            self.finished.append(req)
+            self._record_finished(req)
             done.append(req)
 
-        self._cancelled.extend(done)
         return done
 
     def cancel(self, request_id: str) -> bool:
@@ -326,24 +332,30 @@ class ContinuousBatchingEngine:
         self.request_cancel(request_id)
         return bool(self.apply_cancellations())
 
-    def drain_cancelled(self) -> list[Request]:
-        """Requests cancelled since the last call."""
-        out, self._cancelled = self._cancelled, []
-        return out
+    def _record_finished(self, req: Request) -> None:
+        """Single place a request becomes an outcome."""
+        self.num_finished += 1
+        self.finished.append(req)
+        self._newly_finished.append(req)
 
     def drain_emitted(self) -> list[tuple[Request, int]]:
         """(request, token) pairs produced since the last call."""
         out, self._emitted = self._emitted, []
         return out
 
-    def drain_rejected(self) -> list[Request]:
-        """Requests turned away since the last call.
+    def drain_finished(self) -> list[Request]:
+        """Every request that reached a terminal state since the last call.
 
-        Surfaced separately so the harness can count them without treating a
-        rejection as a completion -- they are the numerator of the rejection
-        rate and must never reach the goodput numerator.
+        One drain rather than three. Scanning `finished` for new entries was
+        O(total requests ever served) on every call -- 5.7us at 100 finished,
+        203.7us at 4,000, growing forever -- so a long-running server would
+        spend most of each step re-reading its own history.
+
+        Completions, rejections, cancellations and preemptions all arrive
+        here. The caller filters by `finish_reason`; the engine does not need
+        three parallel lists to say the same thing.
         """
-        out, self._rejected = self._rejected, []
+        out, self._newly_finished = self._newly_finished, []
         return out
 
     def has_work(self) -> bool:
@@ -361,7 +373,7 @@ class ContinuousBatchingEngine:
             timestamp=time.perf_counter(),
             num_running=len(self.running),
             num_waiting=len(self.waiting),
-            num_finished=len(self.finished),
+            num_finished=self.num_finished,
             kv_blocks_used=a.num_allocated,
             kv_blocks_total=a.num_blocks,
             prefix_cache_hits=self.prefix_cache.stats.hit_blocks,
@@ -404,7 +416,7 @@ class ContinuousBatchingEngine:
                 # request even when empty. Rejecting beats looping forever.
                 self.waiting.popleft()
                 req.finish(FinishReason.REJECTED)
-                self.finished.append(req)
+                self._record_finished(req)
                 done.append(req)
                 continue
 
@@ -421,7 +433,7 @@ class ContinuousBatchingEngine:
             except OutOfBlocks:
                 cache.free()
                 req.finish(FinishReason.PREEMPTED)
-                self.finished.append(req)
+                self._record_finished(req)
                 done.append(req)
                 continue
 
@@ -503,7 +515,7 @@ class ContinuousBatchingEngine:
     def _retire(self, seq: Sequence) -> Request:
         seq.cache.free()
         seq.request.finish(seq.finish_reason or FinishReason.LENGTH)
-        self.finished.append(seq.request)
+        self._record_finished(seq.request)
         return seq.request
 
     # -- execution ----------------------------------------------------------
@@ -602,14 +614,20 @@ class ContinuousBatchingEngine:
     # -- convenience --------------------------------------------------------
 
     def run(self, requests: list[Request]) -> list[Request]:
-        """Drain a list of requests. Rejections are returned alongside them."""
+        """Drain a list of requests. Every outcome is returned, in order.
+
+        Drains `_emitted` as it goes: a caller that never reads it would
+        otherwise accumulate one entry per generated token for the life of the
+        engine.
+        """
         out: list[Request] = []
         for r in requests:
             self.add_request(r)
-            out.extend(self.drain_rejected())
         while self.has_work():
-            out.extend(self.step())
-            out.extend(self.drain_rejected())
+            self.step()
+            self._emitted.clear()
+            out.extend(self.drain_finished())
+        out.extend(self.drain_finished())
         return out
 
 

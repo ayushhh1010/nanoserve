@@ -147,24 +147,16 @@ class AsyncEngine:
         """
         if self.metrics is not None:
             self.metrics.observe_engine(self.engine)
-            # Requests are recorded once, on the transition to finished. The
-            # engine keeps its `finished` list for the life of the process, so
-            # re-observing it every fanout would multiply every counter by the
-            # number of steps.
-            for req in self.engine.finished:
-                if req.request_id not in self._recorded and req.finish_reason is not None:
-                    self._recorded.add(req.request_id)
-                    self.metrics.observe_finished(req)
         for req, token_id in self.engine.drain_emitted():
             stream = self.streams.get(req.request_id)
             if stream is not None:
                 stream.queue.put_nowait(token_id)
 
-        for req in (
-            self.engine.drain_rejected()
-            + self.engine.drain_cancelled()
-            + [r for r in self.engine.finished if r.request_id in self.streams]
-        ):
+        # One drain, O(newly finished). Scanning `engine.finished` here was
+        # O(every request ever served) per call and grew without bound.
+        for req in self.engine.drain_finished():
+            if self.metrics is not None:
+                self.metrics.observe_finished(req)
             stream = self.streams.get(req.request_id)
             if stream is not None and req.finish_reason is not None and not stream.done.is_set():
                 stream.finish_reason = req.finish_reason

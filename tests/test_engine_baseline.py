@@ -394,3 +394,59 @@ def test_summary_separates_throughput_from_goodput(model):
     assert s["counts"]["completed"] == 2
     assert s["throughput"]["output_tokens_per_s"] == pytest.approx(0.2)
     assert s["goodput"]["fraction_met_slo"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Workload times are relative and must be rebased
+# ---------------------------------------------------------------------------
+
+
+def test_workload_times_are_relative():
+    """Documented, because the consequence of forgetting is total.
+
+    build_workload emits arrival times from zero so a workload is reproducible.
+    AdmissionController compares deadlines against perf_counter(), which on a
+    machine that has been up a while is in the hundreds of thousands. An
+    un-rebased deadline is therefore hundreds of thousands of seconds in the
+    past, and every request is rejected as already-late.
+    """
+    import time as _time
+
+    from bench.workload import rebase
+
+    reqs = build_workload(WorkloadConfig(num_requests=5, slo_seconds=10.0), 256, EOS)
+    assert reqs[0].arrival_time == 0.0
+    assert reqs[0].deadline == 10.0
+    assert reqs[0].deadline < _time.perf_counter(), "premise of this test"
+
+    t0 = _time.perf_counter()
+    rebase(reqs, t0)
+    for r in reqs:
+        assert r.deadline > _time.perf_counter()
+
+
+def test_rebase_preserves_the_slo_interval():
+    """Arrival and deadline shift together, or the SLO silently changes."""
+    from bench.workload import rebase
+
+    reqs = build_workload(
+        WorkloadConfig(num_requests=6, request_rate=4.0, slo_seconds=2.5), 256, EOS
+    )
+    before = [(r.deadline - r.arrival_time) for r in reqs]
+    gaps_before = [b.arrival_time - a.arrival_time for a, b in zip(reqs, reqs[1:])]
+
+    rebase(reqs, 1_000_000.0)
+
+    assert [(r.deadline - r.arrival_time) for r in reqs] == pytest.approx(before)
+    assert [b.arrival_time - a.arrival_time for a, b in zip(reqs, reqs[1:])] == pytest.approx(
+        gaps_before
+    )
+
+
+def test_rebase_leaves_best_effort_requests_alone():
+    from bench.workload import rebase
+
+    reqs = build_workload(WorkloadConfig(num_requests=3, slo_seconds=None), 256, EOS)
+    rebase(reqs, 500.0)
+    assert all(r.deadline is None for r in reqs)
+    assert all(r.arrival_time == 500.0 for r in reqs)
