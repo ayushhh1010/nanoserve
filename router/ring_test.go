@@ -21,7 +21,11 @@ func newTestRing(t *testing.T, n int, epsilon float64) *Ring {
 	t.Helper()
 	r := NewRing(DefaultVirtualNodes, epsilon)
 	for i := 0; i < n; i++ {
-		r.Add(fmt.Sprintf("replica-%d", i), fmt.Sprintf("localhost:%d", 9100+i))
+		id := fmt.Sprintf("replica-%d", i)
+		r.Add(id, fmt.Sprintf("localhost:%d", 9100+i))
+		// Add leaves a replica unready on purpose; these tests are about
+		// placement, so they stand in for the health checker.
+		r.SetReady(id, true)
 	}
 	return r
 }
@@ -90,6 +94,7 @@ func TestAddingAReplicaMovesFewKeys(t *testing.T) {
 	}
 
 	r.Add("replica-8", "localhost:9108")
+	r.SetReady("replica-8", true)
 
 	moved := 0
 	for k, was := range before {
@@ -395,6 +400,7 @@ func TestConcurrentTopologyChangesDoNotCorruptTheRing(t *testing.T) {
 		for i := 0; i < 200; i++ {
 			id := fmt.Sprintf("churn-%d", i%5)
 			r.Add(id, "localhost:9999")
+			r.SetReady(id, true)
 			r.Remove(id)
 		}
 	}()
@@ -442,5 +448,26 @@ func TestPrefixKeyHandlesShortPrompts(t *testing.T) {
 	}
 	if got := PrefixKey("hello", 0); got != "hello" {
 		t.Fatalf("zero prefixLen should mean the whole prompt, got %q", got)
+	}
+}
+
+func TestNewReplicasStartUnready(t *testing.T) {
+	// A registry entry says a replica exists, not that it can serve. Marking
+	// it ready on Add sends traffic to a process still loading its model --
+	// which is exactly what happened the first time three replicas were
+	// started: /healthz reported ready instantly and every request failed.
+	r := NewRing(DefaultVirtualNodes, DefaultEpsilon)
+	r.Add("fresh", "localhost:9101")
+
+	if r.ReadyCount() != 0 {
+		t.Fatalf("a newly added replica reported ready: %d", r.ReadyCount())
+	}
+	if _, err := r.Pick("k"); err != ErrNoReplicas {
+		t.Fatalf("picked an unverified replica: %v", err)
+	}
+
+	r.SetReady("fresh", true)
+	if _, err := r.Pick("k"); err != nil {
+		t.Fatalf("still unpickable after health check: %v", err)
 	}
 }

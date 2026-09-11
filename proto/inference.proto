@@ -14,7 +14,10 @@ syntax = "proto3";
 
 package nanoserve.v1;
 
-option go_package = "github.com/nanoserve/router/proto;proto";
+// Generated into the router package itself: the ring, client pool and proxy
+// all speak these types directly, and a separate package would add an import
+// alias to every line of the hot path for no isolation benefit.
+option go_package = "github.com/nanoserve/router;router";
 
 service Inference {
   // One request, a stream of tokens.

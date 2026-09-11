@@ -111,7 +111,11 @@ func (r *Ring) Add(id, addr string) {
 		existing.Addr = addr
 		return
 	}
-	r.replicas[id] = &Replica{ID: id, Addr: addr, Ready: true}
+	// Unready until a health check says otherwise. Trusting a replica the
+	// moment it is registered means routing to a process that is still loading
+	// its model -- the registry says it exists, not that it can serve. The
+	// health checker promotes it on the first successful poll.
+	r.replicas[id] = &Replica{ID: id, Addr: addr, Ready: false}
 	for i := 0; i < r.virtualNodes; i++ {
 		r.points = append(r.points, ringPoint{
 			hash:      hashKey(fmt.Sprintf("%s#%d", id, i)),
