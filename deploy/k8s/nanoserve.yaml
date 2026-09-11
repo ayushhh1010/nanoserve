@@ -1,0 +1,300 @@
+# Nanoserve on Kubernetes (k3s/kind).
+#
+#   kind create cluster --name nanoserve
+#   kubectl apply -f deploy/k8s/nanoserve.yaml
+#   kubectl -n nanoserve port-forward svc/router 8080:8080
+#
+# Images are built locally and loaded into the node, so imagePullPolicy is
+# Never -- otherwise the kubelet tries a registry that does not have them and
+# the pods sit in ErrImagePull with a message that looks like a network fault:
+#   docker build -f deploy/Dockerfile.replica -t nanoserve/replica:dev .
+#   docker build -f deploy/Dockerfile.router  -t nanoserve/router:dev  .
+#   kind load docker-image nanoserve/replica:dev nanoserve/router:dev --name nanoserve
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nanoserve
+---
+# etcd as a StatefulSet, not a Deployment. Its identity is its data: a replaced
+# pod must come back as the same member with the same volume, and a Deployment
+# offers neither stable identity nor stable storage.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: nanoserve
+spec:
+  serviceName: etcd
+  replicas: 1
+  selector:
+    matchLabels: { app: etcd }
+  template:
+    metadata:
+      labels: { app: etcd }
+    spec:
+      containers:
+        - name: etcd
+          image: registry.k8s.io/etcd:3.7.1-0
+          command:
+            - etcd
+            - --name=etcd-0
+            - --data-dir=/etcd-data
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://etcd-0.etcd:2379
+            # Without compaction, a registry taking lease renewals every few
+            # seconds accumulates revisions until the disk fills. The default
+            # is off, which is a fine default for a database and a bad one for
+            # a service registry.
+            - --auto-compaction-mode=revision
+            - --auto-compaction-retention=1000
+          ports: [{ containerPort: 2379, name: client }]
+          volumeMounts:
+            - { name: data, mountPath: /etcd-data }
+          readinessProbe:
+            exec: { command: ["etcdctl", "endpoint", "health"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: nanoserve
+spec:
+  clusterIP: None  # headless: pods are addressed individually
+  selector: { app: etcd }
+  ports: [{ port: 2379, name: client }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: nanoserve
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:8-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: nanoserve
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
+---
+# Replicas are a StatefulSet so each gets a stable hostname. That matters more
+# than it looks: the replica's identity is what the router hashes prompts
+# against, so a rolling restart under a Deployment -- where every pod gets a
+# fresh random name -- would remap the whole keyspace and cold-start every
+# prefix cache in the fleet. Stable names make a restart cost one replica's
+# cache instead of all of them.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: replica
+  namespace: nanoserve
+spec:
+  serviceName: replica
+  replicas: 2
+  podManagementPolicy: Parallel  # no reason to start replicas one at a time
+  selector:
+    matchLabels: { app: replica }
+  template:
+    metadata:
+      labels: { app: replica }
+    spec:
+      # Long enough for the drain to finish. The replica revokes its etcd
+      # lease on SIGTERM and then serves out what is in flight; a grace period
+      # shorter than the longest generation converts every rolling update into
+      # dropped requests, which is the failure nobody attributes to the deploy.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: replica
+          image: nanoserve/replica:dev
+          imagePullPolicy: Never
+          args:
+            - --port=9101
+            - --device=cpu
+            - --checkpoint=/checkpoints/best.pt
+            - --kv-budget-mb=256
+            - --max-batch-size=8
+            - --etcd=etcd:2379
+            - --lease-ttl=10
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          # The advertised address must be one the router can dial. A pod's
+          # own hostname is not resolvable by others unless the pod belongs to
+          # a headless service and sets its subdomain, which the StatefulSet
+          # does via serviceName.
+          command:
+            - /bin/sh
+            - -c
+            - >
+              exec python -u scripts/serve_replica.py
+              --replica-id="$(POD_NAME)"
+              --advertise="$(POD_NAME).replica.nanoserve.svc.cluster.local:9101"
+              "$@"
+            - --
+          ports: [{ containerPort: 9101, name: grpc }]
+          volumeMounts:
+            - { name: checkpoints, mountPath: /checkpoints, readOnly: true }
+          # No readinessProbe. Readiness here is decided by the router's own
+          # gRPC health checks, and a second, disagreeing notion of ready --
+          # Kubernetes' -- would pull pods out of a Service the router is not
+          # using anyway, while telling the router nothing. Discovery is via
+          # etcd, deliberately, so the registry stays the single source of
+          # membership truth.
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 3Gi }
+      volumes:
+        - name: checkpoints
+          hostPath: { path: /checkpoints, type: Directory }
+          # hostPath because the checkpoint is 321 MB of read-only data that
+          # every replica shares. A PVC per replica would copy it N times; a
+          # ReadWriteMany PVC needs a storage class kind does not ship with.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: replica
+  namespace: nanoserve
+spec:
+  clusterIP: None
+  selector: { app: replica }
+  ports: [{ port: 9101, name: grpc }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  namespace: nanoserve
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: router }
+  template:
+    metadata:
+      labels: { app: router }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: router
+          image: nanoserve/router:dev
+          imagePullPolicy: Never
+          args:
+            - --addr=0.0.0.0:8080
+            - --etcd=etcd:2379
+            - --redis=redis:6379
+            - --rpm=6000
+            - --tpm=6000000
+            - --request-burst=200
+            - --token-burst=200000
+          ports: [{ containerPort: 8080, name: http }]
+          readinessProbe:
+            # /healthz answers 503 until at least one replica is ready, so a
+            # router with nothing behind it is kept out of the Service rather
+            # than accepting traffic it cannot serve.
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 3
+          livenessProbe:
+            # Deliberately NOT /healthz. That reports on the fleet, not on this
+            # process, so using it here would restart every healthy router the
+            # moment the replicas went away -- destroying the one component
+            # still able to report the outage.
+            httpGet: { path: /metrics, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 200m, memory: 128Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: router
+  namespace: nanoserve
+spec:
+  selector: { app: router }
+  ports: [{ port: 8080, targetPort: 8080, name: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaler
+  namespace: nanoserve
+spec:
+  # Two, with leader election. One would be a single point of failure whose
+  # death is silent: nothing scaling looks exactly like nothing needing to
+  # scale. Two without an election would be worse than one, because both would
+  # apply the same delta and the fleet would overshoot, then oscillate.
+  replicas: 2
+  selector:
+    matchLabels: { app: autoscaler }
+  template:
+    metadata:
+      labels: { app: autoscaler }
+    spec:
+      containers:
+        - name: autoscaler
+          image: nanoserve/router:dev
+          imagePullPolicy: Never
+          command: ["/autoscaler"]
+          args:
+            - --etcd=etcd:2379
+            - --executor=etcd
+            - --interval=15s
+            - --target-queue-depth=4
+            - --min-replicas=1
+            - --max-replicas=6
+            - --scale-down-stabilization=5m
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+# A PodDisruptionBudget so a node drain cannot take every replica at once.
+# Voluntary disruptions are the ones a cluster does to itself -- upgrades,
+# rebalancing -- and they are far more common than hardware failure.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: replica
+  namespace: nanoserve
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: replica }

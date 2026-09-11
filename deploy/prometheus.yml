@@ -1,0 +1,20 @@
+# Scrape config for the Compose stack.
+#
+# 5s, not the usual 15s. This stack exists to show what happens in the seconds
+# around a replica dying, and a 15s interval samples that entire event two or
+# three times -- the p99 recovery the dashboard is meant to display would be
+# two points and a straight line between them. Short intervals cost storage,
+# which is why retention is capped at 6h in the compose file rather than
+# accepting a coarse view of the only thing worth watching.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: router
+    static_configs:
+      - targets: ["router:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

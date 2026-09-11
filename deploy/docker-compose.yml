@@ -1,0 +1,182 @@
+# The whole system, on one machine.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#   curl -N localhost:8080/generate -H 'content-type: application/json' \
+#        -d '{"prompt":"Once upon a time","max_tokens":60}'
+#
+# Replicas run on CPU here. A GPU needs the NVIDIA container toolkit and a
+# `deploy.resources.reservations.devices` block, which turns a file that runs
+# anywhere into one that runs on one class of machine; the distributed
+# behaviour is identical either way, and only throughput differs.
+#
+# Scale the data plane by hand with:
+#   docker compose -f deploy/docker-compose.yml up --scale replica=4
+# Replicas self-register in etcd, so the router needs no reconfiguration --
+# that is the entire payoff of making the registry the source of membership.
+
+name: nanoserve
+
+services:
+  etcd:
+    image: registry.k8s.io/etcd:3.7.1-0
+    # registry.k8s.io, not gcr.io/etcd-development or quay.io/etcd: both were
+    # deprecated at v3.7 and will not receive 3.8+. The tag carries the "-0"
+    # build-revision suffix that registry uses; plain "v3.7.1" does not exist
+    # there and fails to pull.
+    command:
+      - etcd
+      - --name=nanoserve
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      # Bounded history. etcd keeps every revision until compacted, and a
+      # registry taking lease renewals every few seconds produces revisions
+      # forever -- an uncompacted cluster runs out of disk in days.
+      - --auto-compaction-mode=revision
+      - --auto-compaction-retention=1000
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # Persistence off deliberately. Every key here is a rate-limit bucket with
+    # a short TTL; writing them to disk costs I/O to preserve state that is
+    # worthless by the time anyone would read it back. A cold start with empty
+    # buckets grants one burst of grace, which is the correct trade.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  replica:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.replica
+    depends_on:
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ../checkpoints/run1:/checkpoints:ro
+    environment:
+      OMP_NUM_THREADS: "2"
+    command:
+      - --port=9101
+      - --device=cpu
+      - --checkpoint=/checkpoints/best.pt
+      - --kv-budget-mb=256
+      - --max-batch-size=8
+      - --etcd=etcd:2379
+      # No --advertise and no --replica-id: both are derived per container
+      # below. The advertised address must be what the *router* can dial,
+      # which inside a compose network is the container's own hostname, not
+      # the 0.0.0.0 it binds.
+    deploy:
+      replicas: 2
+    # $$HOSTNAME escapes compose interpolation so the shell inside the
+    # container expands it, giving each replica a distinct identity and a
+    # routable address without any per-replica configuration.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        exec python -u scripts/serve_replica.py
+        --replica-id="$$HOSTNAME"
+        --advertise="$$HOSTNAME:9101"
+        "$$@"
+      - --
+
+  router:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.router
+    depends_on:
+      etcd:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    command:
+      - --addr=0.0.0.0:8080
+      - --etcd=etcd:2379
+      - --redis=redis:6379
+      - --rpm=6000
+      - --tpm=6000000
+      - --request-burst=200
+      - --token-burst=200000
+      - --health-interval=2s
+    healthcheck:
+      # The router reports 503 until at least one replica is ready, so this
+      # gates on the system being able to serve rather than on a process
+      # existing. Written with wget because the image is scratch -- no shell,
+      # no curl. Compose can still exec the binary directly.
+      test: ["CMD", "/router", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  autoscaler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.router
+    entrypoint: ["/autoscaler"]
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command:
+      - --etcd=etcd:2379
+      - --executor=etcd
+      - --interval=10s
+      - --target-queue-depth=4
+      - --min-replicas=1
+      - --max-replicas=6
+      - --scale-down-stabilization=2m
+    # Two instances on purpose: this is the leader election doing visible work.
+    # One campaigns and acts; the other waits in Campaign() and takes over
+    # within a lease TTL if the leader dies. Running two *without* an election
+    # would be worse than running one, since both would apply the same delta
+    # and the fleet would overshoot.
+    deploy:
+      replicas: 2
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    depends_on:
+      - router
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous admin access. This is a local demo stack with no data worth
+      # protecting; requiring a login would only add a step between a reader
+      # and the dashboard that is the point of the exercise. Do not copy this
+      # into anything reachable from a network you do not control.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  etcd-data:

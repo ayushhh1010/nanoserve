@@ -1,0 +1,56 @@
+# Inference replica: the Python data plane.
+#
+# CPU wheels by default. The CUDA wheels are ~2.5 GB and pulling them into an
+# image that may well run on a machine with no GPU is a poor trade; the GPU
+# path is a build argument, and the compose file documents the override. The
+# distributed behaviour this image exists to demonstrate -- discovery, routing,
+# migration, draining -- is identical either way. Only the tokens/second change.
+FROM python:3.12-slim AS base
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Dependencies first, in their own layer: they change far less often than the
+# source, and rebuilding torch on every code edit would make the iteration
+# loop unusable.
+COPY requirements.txt ./
+RUN pip install --index-url ${TORCH_INDEX} --extra-index-url https://pypi.org/simple \
+        -r requirements.txt
+
+# /app on the import path. Running `python scripts/serve_replica.py` puts
+# /app/scripts on sys.path, not /app, so `import engine` fails -- and it fails
+# only in the container, because a dev checkout has the project pip-installed
+# into its virtualenv and never notices. Set here rather than in the base ENV
+# block so editing it does not invalidate the torch install layer.
+ENV PYTHONPATH=/app
+
+COPY engine/ ./engine/
+COPY model/ ./model/
+COPY scripts/ ./scripts/
+COPY proto/ ./proto/
+
+# Non-root. A serving process has no reason to be able to write its own code,
+# and a container that runs as root makes every later escape cheaper.
+RUN useradd --create-home --uid 10001 nanoserve \
+    && chown -R nanoserve:nanoserve /app
+USER nanoserve
+
+# The checkpoint is mounted, not baked. It is 321 MB and changes on a
+# completely different cadence from the server; baking it would tie every
+# code change to a 321 MB layer push.
+VOLUME ["/checkpoints"]
+
+EXPOSE 9101
+
+# No HEALTHCHECK here on purpose: the router health-checks replicas over gRPC
+# already, and that is the signal routing actually uses. A second, disagreeing
+# notion of health -- Docker's -- would restart containers the router
+# considered fine, or keep containers the router had evicted.
+
+ENTRYPOINT ["python", "-u", "scripts/serve_replica.py"]
+CMD ["--port", "9101", "--device", "cpu", "--checkpoint", "/checkpoints/best.pt"]

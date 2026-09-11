@@ -1,0 +1,341 @@
+{
+  "uid": "nanoserve-router",
+  "title": "Nanoserve \u2014 Router",
+  "tags": [
+    "nanoserve"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "What to watch",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Kill a replica under load (`docker compose kill <id>` or `python scripts/chaos.py --only sigkill_replica`) and watch two things: **Ready replicas** steps down, and **TTFT p99** barely moves. The requests that were mid-stream on the dead replica are migrated \u2014 they appear in **Retries & migrations**, not in **Errors**. A migration means a client was already receiving tokens when its replica died; the router replays what it has already delivered as context so the client never sees a duplicate."
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Replicas by state",
+      "description": "'orphaned' are replicas the registry dropped while health still vouched for them. Non-zero means the control plane is degraded and the router is serving on retained membership \u2014 which is the intended behaviour during an etcd outage, and a bug at any other time.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "nanoserve_router_replicas",
+          "legendFormat": "{{state}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to first token",
+      "description": "The number a user feels. Quantiles come from histogram_quantile over the bucket rate, not from an average \u2014 an average TTFT hides exactly the tail that a replica failure produces.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(nanoserve_router_time_to_first_token_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nanoserve_router_time_to_first_token_seconds_bucket[1m])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(nanoserve_router_time_to_first_token_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request outcomes",
+      "description": "As the client saw them. Retries and migrations are deliberately absent here \u2014 they are recoveries, not outcomes, and counting them as failures would misreport a working system.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "stacking": {
+              "mode": "normal"
+            }
+          },
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(nanoserve_router_requests_total[1m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "In-flight per replica",
+      "description": "The spread here is what bounded-load routing produces. Plain consistent hashing under Zipfian prompts pins one replica while others idle; the load cap is what stops that.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "nanoserve_router_replica_inflight",
+          "legendFormat": "{{replica}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Retries & migrations",
+      "description": "A retry is a second dispatch. A migration is a retry that carried already-delivered tokens \u2014 the client was mid-stream when its replica died. Migrations spiking while Errors stays flat is the system working.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(nanoserve_router_retries_total[1m])",
+          "legendFormat": "retries",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        },
+        {
+          "expr": "rate(nanoserve_router_migrations_total[1m])",
+          "legendFormat": "migrations",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end request duration",
+      "description": "Successful requests only. Folding failures in makes a fast failure look like fast service.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(nanoserve_router_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(nanoserve_router_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate limiting",
+      "description": "'degraded' counts admissions granted because Redis was unreachable. Non-zero means limits are not being enforced \u2014 an outage that is otherwise invisible, because every request succeeds.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(nanoserve_router_throttled_total[1m]))",
+          "legendFormat": "throttled/{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        },
+        {
+          "expr": "rate(nanoserve_router_ratelimit_degraded_total[1m])",
+          "legendFormat": "degraded",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "nanoserve-prometheus"
+          }
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "nanoserve-prometheus"
+      }
+    }
+  ]
+}

@@ -38,6 +38,8 @@ type Proxy struct {
 	// reconciler is optional, used only to surface degraded membership in
 	// /stats. The proxy never asks it to make a routing decision.
 	reconciler *Reconciler
+	// metrics is optional; nil means the counters below are the only record.
+	metrics *Metrics
 	// limiter is optional. Nil means no rate limiting, which is a legitimate
 	// single-tenant deployment rather than a missing feature.
 	limiter *RateLimiter
@@ -58,6 +60,12 @@ type Proxy struct {
 // registry's wishes -- a degraded state that is otherwise only in the logs.
 func (p *Proxy) WithReconciler(rc *Reconciler) *Proxy {
 	p.reconciler = rc
+	return p
+}
+
+// WithMetrics attaches the Prometheus surface.
+func (p *Proxy) WithMetrics(m *Metrics) *Proxy {
+	p.metrics = m
 	return p
 }
 
@@ -126,13 +134,16 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 	if p.limiter != nil {
 		v, err := p.limiter.Allow(r.Context(), client, int(body.MaxTokens))
 		if err != nil {
-			p.throttled.Add(1)
+			p.observeThrottle("limiter_unavailable")
 			http.Error(w, `{"error":"rate limiter unavailable"}`,
 				http.StatusServiceUnavailable)
 			return
 		}
 		if v.Degraded {
 			p.degraded.Add(1)
+			if p.metrics != nil {
+				p.metrics.Degraded.Inc()
+			}
 		}
 		if !v.Allowed {
 			p.throttled.Add(1)
@@ -141,10 +152,12 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 			// permanent 413, and telling it to retry would produce a polite
 			// infinite loop indistinguishable from healthy traffic.
 			if v.Permanent() {
+				p.observeThrottle("oversized")
 				http.Error(w, `{"error":"max_tokens exceeds this tier's burst limit"}`,
 					http.StatusRequestEntityTooLarge)
 				return
 			}
+			p.observeThrottle("rate")
 			w.Header().Set("Retry-After",
 				strconv.Itoa(int(math.Ceil(v.RetryAfter.Seconds()))))
 			http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
@@ -153,6 +166,7 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.requests.Add(1)
+	startedAt := time.Now()
 	delivered := 0
 	if p.limiter != nil {
 		defer func() {
@@ -172,8 +186,32 @@ func (p *Proxy) ServeGenerate(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.stream(r.Context(), w, flusher, body, &delivered); err != nil {
 		p.failures.Add(1)
+		p.observeOutcome("error", 0)
 		p.log.Error("request failed", "request_id", body.RequestID, "err", err)
 		writeEvent(w, flusher, "error", map[string]string{"error": err.Error()})
+		return
+	}
+	p.observeOutcome("success", time.Since(startedAt))
+}
+
+func (p *Proxy) observeThrottle(reason string) {
+	p.throttled.Add(1)
+	if p.metrics != nil {
+		p.metrics.Throttled.WithLabelValues(reason).Inc()
+		p.metrics.Requests.WithLabelValues("throttled").Inc()
+	}
+}
+
+func (p *Proxy) observeOutcome(outcome string, d time.Duration) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.Requests.WithLabelValues(outcome).Inc()
+	// Duration on success only. A request that failed in 3ms is not a fast
+	// request, and folding it in drags the latency distribution toward zero
+	// exactly when the system is least healthy.
+	if outcome == "success" {
+		p.metrics.Duration.Observe(d.Seconds())
 	}
 }
 
@@ -207,8 +245,14 @@ func (p *Proxy) stream(
 
 		if attempt > 0 {
 			p.retries.Add(1)
+			if p.metrics != nil {
+				p.metrics.Retries.Inc()
+			}
 			if len(delivered) > 0 {
 				p.migrations.Add(1)
+				if p.metrics != nil {
+					p.metrics.Migrations.Inc()
+				}
 				p.log.Info("migrating request",
 					"request_id", body.RequestID, "to", rep.ID,
 					"tokens_already_sent", len(delivered))
@@ -237,6 +281,7 @@ func (p *Proxy) stream(
 		}
 		if isRejection(err) {
 			p.rejected.Add(1)
+			p.observeOutcome("rejected", 0)
 			writeEvent(w, flusher, "rejected", map[string]string{"reason": err.Error()})
 			return nil
 		}
@@ -255,6 +300,7 @@ func (p *Proxy) attempt(
 	ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
 	rep *Replica, body generateBody, resume []uint32, deadline float64,
 ) ([]uint32, error) {
+	attemptStart := time.Now()
 	stub, err := p.pool.Stub(rep.ID)
 	if err != nil {
 		return nil, err
@@ -293,6 +339,14 @@ func (p *Proxy) attempt(
 
 		switch payload := chunk.Payload.(type) {
 		case *GenerateChunk_Token:
+			if len(resume) == 0 && len(delivered) == 0 && p.metrics != nil {
+				// Only for a request that started here. On a migration the
+				// "first token" the replacement replica produces is not the
+				// client's first token -- it already had some -- and counting
+				// it would report a suspiciously excellent TTFT precisely when
+				// something went wrong.
+				p.metrics.TTFT.Observe(time.Since(attemptStart).Seconds())
+			}
 			delivered = append(delivered, payload.Token.TokenId)
 			writeEvent(w, flusher, "token", map[string]any{
 				"text":  payload.Token.Text,

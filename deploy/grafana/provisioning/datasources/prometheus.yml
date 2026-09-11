@@ -1,0 +1,18 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    # A fixed uid, not a generated one. Provisioned dashboards have to name
+    # their datasource explicitly -- a panel that omits it does not fall back
+    # to "the default", it binds to Grafana's built-in datasource and renders
+    # empty with no error anywhere. Pinning the uid lets the dashboard JSON
+    # reference it without hardcoding whatever Grafana happened to generate.
+    uid: nanoserve-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # Must match prometheus.yml's scrape_interval, or Grafana picks a default
+    # step that silently smooths over exactly the seconds this stack exists
+    # to show.
+    jsonData:
+      timeInterval: 5s

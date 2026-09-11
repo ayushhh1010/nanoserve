@@ -1,0 +1,40 @@
+# Go control plane: router and autoscaler, one image, two entrypoints.
+#
+# Multi-stage, and the second stage is scratch. A statically linked Go binary
+# needs nothing from a base image, so shipping one buys only attack surface:
+# no shell, no package manager, and nothing for an attacker who reaches code
+# execution to pivot with. The image is a few tens of MB instead of a few
+# hundred.
+FROM golang:1.27-alpine AS build
+
+WORKDIR /src
+
+# Module files first so dependency downloads cache independently of source.
+COPY router/go.mod router/go.sum ./
+RUN go mod download
+
+COPY router/ ./
+
+# CGO_ENABLED=0 is what makes `FROM scratch` possible at all -- with cgo the
+# binary would need a libc that scratch does not have.
+# -trimpath keeps build-machine paths out of the binary, so the image is
+# reproducible and does not leak the directory layout it was built in.
+ENV CGO_ENABLED=0 GOOS=linux
+RUN go build -trimpath -ldflags="-s -w" -o /out/router ./cmd/router \
+ && go build -trimpath -ldflags="-s -w" -o /out/autoscaler ./cmd/autoscaler
+
+FROM scratch AS runtime
+
+# CA roots, for the day etcd or Redis is reached over TLS. Copied rather than
+# assumed: scratch has no certificate store, and the failure without them is a
+# confusing x509 error at connect time rather than anything obviously missing.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+COPY --from=build /out/router /router
+COPY --from=build /out/autoscaler /autoscaler
+
+# Numeric, because scratch has no /etc/passwd for a name to resolve against.
+USER 10001:10001
+
+EXPOSE 8080
+ENTRYPOINT ["/router"]

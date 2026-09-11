@@ -18,6 +18,9 @@ import (
 	"time"
 
 	"github.com/nanoserve/router"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -103,8 +106,20 @@ func main() {
 	checker := router.NewHealthChecker(ring, pool, *healthEvery, *healthWait, log)
 	go checker.Run(ctx)
 
+	// A private registry rather than the default one. prometheus.DefaultRegisterer
+	// is global state that any dependency can write to, so a library adding a
+	// metric with a colliding name would panic this process at startup.
+	promReg := prometheus.NewRegistry()
+	promReg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	metrics := router.NewMetrics(promReg)
+	go metrics.RunRingObserver(ctx.Done(), ring, reconciler, 2*time.Second)
+
 	proxy := router.NewProxy(ring, pool, *prefixLen, *maxRetries, log).
-		WithReconciler(reconciler)
+		WithReconciler(reconciler).
+		WithMetrics(metrics)
 
 	if *redisAddr != "" {
 		cfg := router.DefaultRateLimitConfig()
@@ -134,6 +149,12 @@ func main() {
 		}
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.Handle("GET /metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{
+		// Surface scrape-time errors as HTTP 500 rather than a partial body:
+		// a truncated exposition silently becomes gaps in a dashboard, which
+		// read as "the system was idle" instead of "the scrape failed".
+		ErrorHandling: promhttp.HTTPErrorOnError,
+	}))
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(proxy.Stats())
