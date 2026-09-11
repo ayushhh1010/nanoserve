@@ -51,14 +51,14 @@ func NewProxy(ring *Ring, pool *ClientPool, prefixLen, maxRetries int, log *slog
 }
 
 type generateBody struct {
-	Prompt      string   `json:"prompt"`
-	MaxTokens   uint32   `json:"max_tokens"`
-	Temperature float32  `json:"temperature"`
-	TopK        uint32   `json:"top_k"`
-	TopP        float32  `json:"top_p"`
-	IgnoreEOS   bool     `json:"ignore_eos"`
-	SLOSeconds  float64  `json:"slo_seconds"`
-	RequestID   string   `json:"request_id"`
+	Prompt      string  `json:"prompt"`
+	MaxTokens   uint32  `json:"max_tokens"`
+	Temperature float32 `json:"temperature"`
+	TopK        uint32  `json:"top_k"`
+	TopP        float32 `json:"top_p"`
+	IgnoreEOS   bool    `json:"ignore_eos"`
+	SLOSeconds  float64 `json:"slo_seconds"`
+	RequestID   string  `json:"request_id"`
 }
 
 // ServeGenerate handles POST /generate with an SSE response.
@@ -180,9 +180,9 @@ func (p *Proxy) attempt(
 			TopP:        body.TopP,
 			IgnoreEos:   body.IgnoreEOS,
 		},
-		RequestId:     body.RequestID,
-		DeadlineUnix:  deadline,
-		ResumeTokens:  resume,
+		RequestId:    body.RequestID,
+		DeadlineUnix: deadline,
+		ResumeTokens: resume,
 	}
 
 	stream, err := stub.Generate(ctx, req)

@@ -27,6 +27,12 @@ def main() -> None:
     ap.add_argument("--max-batch-size", type=int, default=64)
     ap.add_argument("--max-queue-depth", type=int, default=64)
     ap.add_argument("--replica-id", default=None)
+    ap.add_argument("--etcd", default=None,
+                    help="comma-separated etcd endpoints; omit to skip registration")
+    ap.add_argument("--advertise", default=None,
+                    help="address the router should dial; defaults to 127.0.0.1:PORT")
+    ap.add_argument("--lease-ttl", type=int, default=10,
+                    help="seconds before a dead replica leaves the registry")
     args = ap.parse_args()
 
     asyncio.run(
@@ -35,6 +41,7 @@ def main() -> None:
             device=args.device, dtype=args.dtype, kv_budget_mb=args.kv_budget_mb,
             block_size=args.block_size, max_batch_size=args.max_batch_size,
             max_queue_depth=args.max_queue_depth, replica_id=args.replica_id,
+            etcd=args.etcd, advertise=args.advertise, lease_ttl=args.lease_ttl,
         )
     )
 

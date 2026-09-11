@@ -72,7 +72,7 @@ type Replica struct {
 }
 
 type ringPoint struct {
-	hash     uint64
+	hash      uint64
 	replicaID string
 }
 

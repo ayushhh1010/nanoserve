@@ -35,6 +35,7 @@ import torch
 
 from engine.admission import AdmissionConfig
 from engine.block_manager import PagedCachePool, blocks_for_budget
+from engine.discovery import RegistrationConfig, ReplicaRegistration
 from engine.pb import inference_pb2 as pb
 from engine.pb import inference_pb2_grpc as rpc
 from engine.scheduler import ContinuousBatchingEngine
@@ -246,6 +247,15 @@ async def serve(
     #: Windows here, and a bind failure surfaces at the client as a bare
     #: "connection refused" with nothing pointing at the server.
     host: str = "0.0.0.0",
+    #: Comma-separated etcd endpoints. Empty means no self-registration: the
+    #: router is being given a static replica list instead, which is a real
+    #: deployment (a pinned Compose file), not a fallback.
+    etcd: str | None = None,
+    #: What to publish to the registry. Must be an address the *router* can
+    #: dial, which is not always the address we bind: we bind 0.0.0.0, and in
+    #: a container the routable address is the service name, not the bind.
+    advertise: str | None = None,
+    lease_ttl: int = 10,
 ) -> None:
     """Run one replica until cancelled."""
     started = time.perf_counter()
@@ -274,9 +284,34 @@ async def serve(
     await server.start()
     print(f"{replica_id} listening on {host}:{port} "
           f"({pool.allocator.num_blocks:,} KV blocks)", flush=True)
+
+    # Register only now. Everything above -- loading the checkpoint, sizing the
+    # KV pool, binding the port -- takes seconds, and a replica that appears in
+    # the registry before it can serve is one the router will happily route to
+    # and that will fail every request it gets. Presence in a registry has to
+    # mean "can serve", not "exists"; an earlier version of the ring made the
+    # same mistake in Go and lost every request in the first end-to-end run.
+    registration = None
+    if etcd:
+        registration = ReplicaRegistration(
+            RegistrationConfig(
+                endpoints=[e for e in etcd.split(",") if e.strip()],
+                replica_id=replica_id,
+                addr=advertise or f"127.0.0.1:{port}",
+                ttl_seconds=lease_ttl,
+            )
+        )
+        registration.start()
+
     try:
         await server.wait_for_termination()
     finally:
+        # Deregister first, drain second. Revoking the lease pulls us out of
+        # rotation in milliseconds, so the router stops sending *new* work
+        # while we still have the grace period to finish the work in flight.
+        # Draining first would spend the whole grace period still receiving.
         servicer.draining = True
+        if registration is not None:
+            await asyncio.to_thread(registration.stop)
         await server.stop(grace=10)
         await ae.stop()
