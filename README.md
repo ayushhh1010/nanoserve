@@ -155,6 +155,15 @@ rather than doing it.
 ## Running it
 
 ```bash
+# Setup. The editable install is not optional: requirements.txt declares the
+# dependencies, not the package, so without it `import engine` fails from a
+# fresh clone -- which is exactly how CI failed while every developer machine
+# passed, because those had been installed months earlier and nobody noticed.
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+pip install -e .
+python scripts/gen_proto.py
+
 # Infrastructure
 docker run -d --name nanoserve-etcd -p 2379:2379 registry.k8s.io/etcd:3.7.1-0 \
   etcd --name n1 --listen-client-urls http://0.0.0.0:2379 \

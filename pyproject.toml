@@ -14,6 +14,12 @@ packages = ["model", "engine", "bench"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The repo root, so `import engine` resolves without installing the package.
+# Without this, bare `pytest` fails to collect every test while
+# `python -m pytest` passes -- the latter puts the cwd on sys.path and the
+# former does not. That difference hid this bug locally for months: the dev
+# venv had an editable install, so nothing ever exercised the bare path.
+pythonpath = ["."]
 addopts = "-q"
 # asyncio tests are marked with pytestmark at module level; "auto" lets them
 # run without decorating every function.
