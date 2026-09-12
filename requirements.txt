@@ -30,5 +30,12 @@ safetensors>=0.4     # model export
 huggingface-hub>=0.24
 pytest>=8.0
 pytest-timeout>=2.3     # CI-only: a hung test should fail, not burn the job
+pytest-asyncio>=1.0      # test-only: pyproject sets asyncio_mode=auto, and
+                         # without this plugin every async test in
+                         # tests/test_server.py errors at setup. It was
+                         # installed ad hoc here and never declared, so a clean
+                         # checkout failed where this machine passed -- the
+                         # same way the serving deps did before the container
+                         # build caught them.
 transformers>=4.44   # test-only: HF Llama parity reference
 pypdf>=5.0           # test-only: PDF verification

@@ -20,6 +20,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -295,13 +296,29 @@ class Cluster:
         self.quiet = quiet
         self.replica_procs: list[subprocess.Popen | None] = []
         self.router: subprocess.Popen | None = None
+        self._logdir: Path | None = None
+        self._log_handles: list = []
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start(self, ready_timeout: float = 300.0) -> None:
-        sink = subprocess.DEVNULL if self.quiet else None
+    #: How long a cluster gets to come up. Overridable because the right value
+    #: is a property of the machine, not the test: three replicas each import
+    #: torch and load a checkpoint, which is seconds on a 12-core desktop and
+    #: minutes on a shared CI runner with four cores and cold page cache.
+    READY_TIMEOUT = float(os.environ.get("NANOSERVE_READY_TIMEOUT", "300"))
+
+    def start(self, ready_timeout: float | None = None) -> None:
+        if ready_timeout is None:
+            ready_timeout = self.READY_TIMEOUT
+        # Captured to files rather than discarded. Sending replica output to
+        # DEVNULL made every startup failure look identical from the outside:
+        # "cluster never reached N ready replicas" is what a crashed replica, a
+        # missing checkpoint, an unreachable etcd and a merely slow machine all
+        # print. CI hit exactly that and the log said nothing about which one
+        # it was. Keeping the streams means the failure path can show them.
+        self._logdir = Path(tempfile.mkdtemp(prefix="nanoserve-chaos-"))
         for i in range(self.n):
-            self.replica_procs.append(self._spawn_replica(i, sink))
+            self.replica_procs.append(self._spawn_replica(i))
 
         router_bin = ROOT / "router" / "router.exe"
         if not router_bin.exists():
@@ -320,16 +337,19 @@ class Cluster:
                 "--request-burst", str(self.request_burst),
                 "--token-burst", str(self.token_burst),
             ]
-        self.router = subprocess.Popen(argv, cwd=ROOT, stdout=sink, stderr=sink)
+        self.router = subprocess.Popen(
+            argv, cwd=ROOT, **self._streams("router"))
 
         if not self.wait_ready(self.n, timeout=ready_timeout):
+            detail = self._dump_logs()
             self.stop()
             raise SystemExit(
-                f"cluster never reached {self.n} ready replicas; "
-                f"check that etcd is up at {self.etcd}"
+                f"cluster never reached {self.n} ready replicas in "
+                f"{ready_timeout:.0f}s (etcd {self.etcd}, device {self.device})"
+                f"\n{detail}"
             )
 
-    def _spawn_replica(self, index: int, sink) -> subprocess.Popen:
+    def _spawn_replica(self, index: int) -> subprocess.Popen:
         port = self.base_port + index
         return subprocess.Popen(
             [sys.executable, "-u", str(ROOT / "scripts" / "serve_replica.py"),
@@ -338,7 +358,7 @@ class Cluster:
              "--etcd", self.etcd, "--advertise", f"127.0.0.1:{port}",
              "--lease-ttl", str(self.lease_ttl),
              "--max-batch-size", str(self.max_batch_size)],
-            cwd=ROOT, stdout=sink, stderr=sink, **_process_group(),
+            cwd=ROOT, **self._streams(f"replica-{index}"), **_process_group(),
         )
 
     def stop(self) -> None:
@@ -358,6 +378,16 @@ class Cluster:
                 p.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 p.kill()
+
+        # Only after every child has exited: closing a handle a running process
+        # still writes to is how a scenario ends with a ValueError instead of
+        # its result, on Windows especially.
+        for h in self._log_handles:
+            try:
+                h.close()
+            except (OSError, ValueError):
+                pass
+        self._log_handles.clear()
 
     # -- faults -------------------------------------------------------------
 
@@ -409,6 +439,40 @@ class Cluster:
             return int(self.stats().get("ready", 0))
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             return 0
+
+    def _streams(self, name: str) -> dict:
+        """Popen kwargs that keep a process's output where it can be read.
+
+        Not quiet-vs-loud: quiet means "do not interleave three replicas into
+        my terminal", which is reasonable, and it should never have meant
+        "throw the evidence away".
+        """
+        if not self.quiet:
+            return {}
+        path = self._logdir / f"{name}.log"
+        handle = open(path, "w", encoding="utf-8", errors="replace")
+        self._log_handles.append(handle)
+        return {"stdout": handle, "stderr": subprocess.STDOUT}
+
+    def _dump_logs(self, lines: int = 25) -> str:
+        """The tail of every captured stream, for a failure message."""
+        for h in self._log_handles:
+            try:
+                h.flush()
+            except ValueError:
+                pass
+        if self._logdir is None:
+            return "(no captured output; cluster was started non-quiet)"
+        out = []
+        for path in sorted(self._logdir.glob("*.log")):
+            try:
+                tail = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError as exc:
+                out.append(f"--- {path.name}: unreadable ({exc})")
+                continue
+            body = "\n".join(tail[-lines:]) if tail else "(no output at all)"
+            out.append(f"--- {path.name} (last {lines} lines) ---\n{body}")
+        return "\n".join(out) if out else "(no log files were written)"
 
     def wait_ready(self, want: int, timeout: float = 300.0) -> bool:
         deadline = time.time() + timeout

@@ -164,6 +164,18 @@ jobs:
       - name: Run chaos suite
         env:
           NANOSERVE_DEVICE: cpu
+          # A hosted runner has four cores and three replicas start at once.
+          # Left at torch's default, each spawns a full thread pool and the
+          # three of them oversubscribe the box three-to-one -- so startup,
+          # which is the part that has to finish inside the readiness window,
+          # is exactly what gets starved. The Compose file already pins this
+          # for the same reason.
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          # Loading three CPU replicas on a cold, shared runner is minutes,
+          # not the seconds it takes on a developer box. The first CI run
+          # timed out here at the 300s default.
+          NANOSERVE_READY_TIMEOUT: "600"
         run: python scripts/chaos.py --device cpu
 
       - name: Upload results
