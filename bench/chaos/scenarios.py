@@ -29,6 +29,7 @@ from bench.chaos.harness import (
     FaultProxy,
     _process_group,
     LoadDriver,
+    DEVICE,
     docker,
     one_request,
     summarise,
@@ -211,7 +212,7 @@ def network_partition(concurrency: int = 12, hold: float = 12.0) -> ScenarioResu
         third = subprocess.Popen(
             [sys.executable, "-u", str(ROOT / "scripts" / "serve_replica.py"),
              "--port", "9103", "--replica-id", "replica-partitioned",
-             "--device", "cuda", "--kv-budget-mb", "192",
+             "--device", DEVICE, "--kv-budget-mb", "192",
              "--max-batch-size", "8", "--etcd", "127.0.0.1:2379",
              "--advertise", f"127.0.0.1:{proxy_port}", "--lease-ttl", "30"],
             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -544,7 +545,7 @@ def slow_replica(
         slow = subprocess.Popen(
             [sys.executable, "-u", str(ROOT / "scripts" / "serve_replica.py"),
              "--port", "9104", "--replica-id", "replica-slow",
-             "--device", "cuda", "--kv-budget-mb", "192",
+             "--device", DEVICE, "--kv-budget-mb", "192",
              "--max-batch-size", "8", "--etcd", "127.0.0.1:2379",
              "--advertise", f"127.0.0.1:{proxy_port}", "--lease-ttl", "10"],
             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

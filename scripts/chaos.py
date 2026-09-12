@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import traceback
@@ -27,6 +28,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Set before importing the scenarios: they read the device at import time.
+if "--device" in sys.argv:
+    os.environ["NANOSERVE_DEVICE"] = sys.argv[sys.argv.index("--device") + 1]
 
 from bench.chaos.scenarios import ALL, ScenarioResult  # noqa: E402
 
@@ -71,6 +76,8 @@ def main() -> int:
     ap.add_argument("--only", action="append", default=None,
                     help="run just these scenarios (repeatable)")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--device", default=os.environ.get("NANOSERVE_DEVICE", "cuda"),
+                    help="device for chaos replicas; cpu for machines with no GPU")
     ap.add_argument("--out", default=str(ROOT / "bench" / "results" / "chaos.json"))
     args = ap.parse_args()
 

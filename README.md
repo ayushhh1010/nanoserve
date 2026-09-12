@@ -1,5 +1,8 @@
 # Nanoserve
 
+[![CI](https://github.com/ayushhh1010/nanoserve/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushhh1010/nanoserve/actions/workflows/ci.yml)
+[![Model on HF](https://img.shields.io/badge/%F0%9F%A4%97%20model-nanoserve--27m-yellow)](https://huggingface.co/ayushhh1010/nanoserve-27m)
+
 A 27M-parameter language model trained from scratch, an inference engine built
 to serve it, and a distributed serving layer to run many of them — written
 without an LLM serving framework, so that every mechanism that usually arrives

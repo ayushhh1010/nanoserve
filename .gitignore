@@ -28,3 +28,10 @@ router/router
 controller/controller.exe
 controller/controller
 router/*.exe
+
+# The phase reports live in writeups/. scripts/make_report.py writes a copy to
+# the repo root as a convenience; the leading slash pins this to the root so the
+# tracked writeups/ copy is unaffected. Ignored rather than deleted because the
+# generator recreates it on every run, and an untracked file that keeps coming
+# back is one `git add -A` away from being committed twice.
+/Nanoserve-Phase1-Report.pdf

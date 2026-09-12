@@ -57,6 +57,13 @@ services:
       retries: 10
 
   replica:
+    # Named explicitly so Compose and Kubernetes build the SAME artifact.
+    # Compose otherwise tags builds <project>-<service>:latest, which drifted
+    # from the nanoserve/replica:dev the manifests reference -- the k8s path
+    # was running a build three weeks stale, missing PYTHONPATH, and failing
+    # with ModuleNotFoundError while Compose worked fine. Two names for one
+    # thing is how that hides.
+    image: nanoserve/replica:dev
     build:
       context: ..
       dockerfile: deploy/Dockerfile.replica
@@ -94,6 +101,7 @@ services:
       - --
 
   router:
+    image: nanoserve/router:dev
     build:
       context: ..
       dockerfile: deploy/Dockerfile.router
@@ -125,6 +133,7 @@ services:
       start_period: 5s
 
   autoscaler:
+    image: nanoserve/router:dev
     build:
       context: ..
       dockerfile: deploy/Dockerfile.router

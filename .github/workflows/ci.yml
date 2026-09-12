@@ -1,0 +1,183 @@
+name: CI
+
+# Chaos runs on every push, not nightly. A resilience suite that only runs on a
+# schedule tells you a week later that a change broke failover, by which point
+# the change is buried under twenty others. The whole value of asserting on
+# recovery is knowing which commit stopped recovering.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # CPU wheels. The runner has no GPU, and the CUDA build is a ~2.5 GB download
+  # to produce identical results on a machine that cannot use any of it.
+  TORCH_INDEX: https://download.pytorch.org/whl/cpu
+
+jobs:
+  go:
+    name: Go — unit and etcd integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: router/go.mod
+          cache-dependency-path: router/go.sum
+
+      # Named container rather than a `services:` block: the chaos scenarios
+      # stop and start etcd by this exact name to simulate a control-plane
+      # outage, and a service container is owned by the runner, not by us.
+      # Keeping both jobs on the same mechanism means CI exercises the same
+      # path a developer does.
+      - name: Start etcd
+        run: |
+          docker run -d --name nanoserve-etcd -p 2379:2379 \
+            registry.k8s.io/etcd:3.7.1-0 \
+            etcd --name n1 \
+                 --listen-client-urls http://0.0.0.0:2379 \
+                 --advertise-client-urls http://127.0.0.1:2379 \
+                 --data-dir /tmp/etcd
+          for i in $(seq 1 30); do
+            if docker exec nanoserve-etcd etcdctl endpoint health 2>/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "etcd never became healthy"; docker logs nanoserve-etcd; exit 1
+
+      - name: Vet
+        working-directory: router
+        run: go vet ./...
+
+      - name: Gofmt
+        working-directory: router
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      # NANOSERVE_ETCD opts the integration tests in. Without it they skip, so
+      # a contributor with no Docker still gets a green unit run rather than a
+      # wall of failures that say nothing about their change.
+      - name: Test
+        working-directory: router
+        env:
+          NANOSERVE_ETCD: 127.0.0.1:2379
+          NANOSERVE_ETCD_CONTAINER: nanoserve-etcd
+        run: go test ./... -count=1 -race -timeout 15m
+
+  python:
+    name: Python — unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url "$TORCH_INDEX"
+          pip install -r requirements.txt
+
+      - name: Generate protobuf stubs
+        run: python scripts/gen_proto.py
+
+      - name: Test
+        run: pytest -q --timeout=600
+
+  chaos:
+    name: Chaos — 7 scenarios
+    runs-on: ubuntu-latest
+    # Three model replicas per scenario, on CPU, seven times over. Slower than
+    # the unit suites by a wide margin and worth every second: these are the
+    # only tests that assert the system survives things rather than computes
+    # things.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: router/go.mod
+          cache-dependency-path: router/go.sum
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url "$TORCH_INDEX"
+          pip install -r requirements.txt
+
+      - name: Generate protobuf stubs
+        run: python scripts/gen_proto.py
+
+      - name: Build control plane
+        working-directory: router
+        run: |
+          go build -o router ./cmd/router
+          go build -o autoscaler ./cmd/autoscaler
+
+      - name: Start etcd and Redis
+        run: |
+          docker run -d --name nanoserve-etcd -p 2379:2379 \
+            registry.k8s.io/etcd:3.7.1-0 \
+            etcd --name n1 \
+                 --listen-client-urls http://0.0.0.0:2379 \
+                 --advertise-client-urls http://127.0.0.1:2379 \
+                 --data-dir /tmp/etcd
+          # 6380, matching the developer setup. On this runner 6379 is free,
+          # but a WSL Redis squats on 6379 on the machine this was built on and
+          # `docker stop` left the port still answering PING -- which made a
+          # "Redis is down" scenario pass against a Redis that was up. Same
+          # port everywhere means the suite cannot quietly diverge.
+          docker run -d --name nanoserve-redis -p 6380:6379 redis:8-alpine
+          for i in $(seq 1 30); do
+            if docker exec nanoserve-etcd etcdctl endpoint health 2>/dev/null \
+               && docker exec nanoserve-redis redis-cli ping 2>/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "dependencies never became healthy"
+          docker logs nanoserve-etcd; docker logs nanoserve-redis; exit 1
+
+      # The trained checkpoint is 321 MB and is not in git. Chaos asserts on
+      # request lifecycle -- migration, drain, admission -- and reads no
+      # weights, so random ones are correct here. They would be worthless for
+      # anything that measures quality.
+      - name: Generate test checkpoint
+        run: python scripts/make_test_checkpoint.py
+
+      - name: Run chaos suite
+        env:
+          NANOSERVE_DEVICE: cpu
+        run: python scripts/chaos.py --device cpu
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: chaos-results
+          path: bench/results/chaos.json
+          if-no-files-found: warn
+
+      # Logs only on failure. A green run's logs are never read; a red run's
+      # are the only thing that explains which scenario stopped recovering.
+      - name: Dump dependency logs
+        if: failure()
+        run: |
+          echo "--- etcd"; docker logs nanoserve-etcd 2>&1 | tail -50
+          echo "--- redis"; docker logs nanoserve-redis 2>&1 | tail -50

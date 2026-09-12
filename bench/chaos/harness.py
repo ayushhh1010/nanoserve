@@ -29,6 +29,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 
+#: Device the chaos replicas run on. An env var rather than a plain default
+#: because CI has no GPU and the scenarios previously hardcoded "cuda" in two
+#: places -- so the suite could only ever run on this one laptop, which is the
+#: opposite of what a chaos suite is for. Defaults to cuda so a developer run
+#: is unchanged.
+DEVICE = os.environ.get("NANOSERVE_DEVICE", "cuda")
+
 
 @dataclass
 class RequestOutcome:
@@ -253,7 +260,7 @@ class Cluster:
         redis: str = "",
         router_addr: str = "127.0.0.1:8080",
         base_port: int = 9101,
-        device: str = "cuda",
+        device: str = DEVICE,
         kv_budget_mb: int = 192,
         lease_ttl: int = 5,
         #: Small on purpose. A 27M model on this GPU will happily batch 64

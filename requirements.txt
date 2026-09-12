@@ -29,5 +29,6 @@ reportlab>=4.0       # phase reports
 safetensors>=0.4     # model export
 huggingface-hub>=0.24
 pytest>=8.0
+pytest-timeout>=2.3     # CI-only: a hung test should fail, not burn the job
 transformers>=4.44   # test-only: HF Llama parity reference
 pypdf>=5.0           # test-only: PDF verification
