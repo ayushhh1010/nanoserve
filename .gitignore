@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+venv/
+# Both spellings. Only .venv/ was ignored, so a second environment created
+# by `python -m venv venv` sat untracked and one `git add -A` away from
+# putting 18 MB of site-packages into the repository.
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
